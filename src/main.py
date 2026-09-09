@@ -10,6 +10,7 @@ from tkinter import font as tkfont
 from datetime import datetime, timedelta
 from pathlib import Path
 import calendar
+import ctypes
 import io
 import logging
 import math
@@ -18,6 +19,11 @@ import re
 import sys
 import threading
 import webbrowser
+
+# Windows の電源管理API（SetThreadExecutionState）用フラグ。
+# 予約録音を控えている間・録音中は、アイドルによる自動スリープを抑止するために使う。
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
 
 from PIL import Image, ImageDraw, ImageTk
 import pystray
@@ -102,6 +108,7 @@ class RecRApp:
         self._active_recordings = {}
         self._tray_icon = None
         self._tray_hint_shown = settings.get('tray_hint_shown', False)
+        self._sleep_prevented = False
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_button)
         self._refresh_stale_stations()
@@ -2091,7 +2098,26 @@ class RecRApp:
     def _schedule_reservation_check(self):
         """予約録音の開始時刻が来ていないか一定間隔でチェックする"""
         self._check_due_reservations()
+        self._update_sleep_prevention()
         self._reservation_check_job = self.root.after(15000, self._schedule_reservation_check)
+
+    def _update_sleep_prevention(self):
+        """有効な予約が存在する間、または録音中は、Windowsのアイドルによる自動スリープを抑止する。
+
+        SetThreadExecutionStateはユーザーの手動スリープ/休止操作や休止状態への
+        移行までは防げないが、放置による自動スリープでの予約録音の取りこぼしは防げる。
+        """
+        should_prevent = self.manager.is_recording_active() or any(
+            res.get('enabled', True) for res in self.manager.load_reservations()
+        )
+        if should_prevent == self._sleep_prevented:
+            return
+        try:
+            flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED if should_prevent else _ES_CONTINUOUS
+            ctypes.windll.kernel32.SetThreadExecutionState(flags)
+            self._sleep_prevented = should_prevent
+        except (AttributeError, OSError) as e:
+            logger.warning(f"スリープ抑止状態の変更に失敗しました: {e}")
 
     def _schedule_reservation_list_minute_refresh(self):
         """予約一覧の状態（成功/失敗/録音中）は時間経過で変わるため、毎分0秒に再描画する"""
