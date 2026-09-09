@@ -1220,12 +1220,23 @@ class RecRApp:
         """番組表で番組をダブルクリックした時の処理
 
         現在放送中の番組であれば、予約ではなく「今すぐ録音するか」を確認するダイアログを出す。
+        すでに終了した過去の番組は、RecRがタイムフリー（過去放送のダウンロード）に
+        対応していないため録音できない旨を伝えるだけで何もしない。
         それ以外（未来の番組）は、その番組の内容を入力済みの状態で新規予約録音ダイアログを開く。
         """
         now = datetime.now()
         start_dt, end_dt = self._program_air_window(program)
         if start_dt and start_dt <= now < end_dt:
             self._confirm_immediate_recording(program, end_dt)
+            return
+
+        if end_dt and end_dt <= now:
+            messagebox.showinfo(
+                "録音できません",
+                f"「{program.get('title', '')}」はすでに放送を終了しています。\n"
+                "RecR はタイムフリー（過去の放送のダウンロード）には対応していないため、"
+                "録音できません。"
+            )
             return
 
         date_iso = program.get('date_iso') or datetime.now().strftime("%Y-%m-%d")
