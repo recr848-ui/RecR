@@ -78,6 +78,7 @@ class RecRApp:
         self._current_programs = []
 
         self.eq_mode_var = tk.StringVar(value=settings.get('eq_mode', 'spectrum'))
+        self.prevent_sleep_var = tk.BooleanVar(value=settings.get('prevent_sleep', True))
         self.filename_pattern_var = tk.StringVar(
             value=settings.get('recording_filename_pattern', self.manager.DEFAULT_FILENAME_PATTERN)
         )
@@ -571,6 +572,11 @@ class RecRApp:
         )
         settings_menu.add_command(
             label="全局自動更新の時刻...", command=self._change_full_schedule_refresh_time
+        )
+        settings_menu.add_separator()
+        settings_menu.add_checkbutton(
+            label="予約待機中・録音中は自動スリープを抑止する",
+            variable=self.prevent_sleep_var, command=self._on_prevent_sleep_changed
         )
         menubar.add_cascade(label="設定", menu=settings_menu)
 
@@ -2101,14 +2107,22 @@ class RecRApp:
         self._update_sleep_prevention()
         self._reservation_check_job = self.root.after(15000, self._schedule_reservation_check)
 
+    def _on_prevent_sleep_changed(self):
+        """設定メニューの「自動スリープを抑止する」チェック切り替え時の保存処理"""
+        self.manager.save_settings({'prevent_sleep': self.prevent_sleep_var.get()})
+        self._update_sleep_prevention()
+
     def _update_sleep_prevention(self):
         """有効な予約が存在する間、または録音中は、Windowsのアイドルによる自動スリープを抑止する。
 
         SetThreadExecutionStateはユーザーの手動スリープ/休止操作や休止状態への
         移行までは防げないが、放置による自動スリープでの予約録音の取りこぼしは防げる。
+        設定メニューでオフにしている場合はこの抑止を行わない。
         """
-        should_prevent = self.manager.is_recording_active() or any(
-            res.get('enabled', True) for res in self.manager.load_reservations()
+        should_prevent = self.prevent_sleep_var.get() and (
+            self.manager.is_recording_active() or any(
+                res.get('enabled', True) for res in self.manager.load_reservations()
+            )
         )
         if should_prevent == self._sleep_prevented:
             return
