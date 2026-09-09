@@ -44,6 +44,8 @@ python src/main.py
 
 録音ファイルは既定で `%USERPROFILE%\Music\RecR\` に保存されます（設定メニューから変更可能）。
 
+詳しい操作方法は [操作マニュアル](docs/MANUAL.md) を参照してください。
+
 ## プロジェクト構成
 
 ```
