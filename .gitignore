@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Build artifacts
+build/
+dist/
+
+# Runtime / user data (logs, cache, reservations, downloaded thumbnails, settings)
+config/
+
+# Local test outputs
+test_out*.m4a
+test_out*.mp3
+
+# Editor
+.vscode/*
+!.vscode/tasks.json
