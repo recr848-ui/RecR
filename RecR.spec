@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 a = Analysis(
     ['src/main.py'],
-    pathex=[],
+    pathex=['.'],
     binaries=[],
     datas=collect_data_files('sv_ttk'),
     hiddenimports=[],
