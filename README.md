@@ -9,9 +9,11 @@ RecR は radiko.jp のラジオ放送を Windows デスクトップで録音す�
 - ライブ再生とグラフィックイコライザー表示（スペクトラム／アナログ針ピークメーターの2モード）
 - ラテ欄風の番組表グリッド表示（最大10日分、番組サムネイル付き）
 - 番組表からのキーワード検索（局横断・番組名/概要/出演者が対象）
-- 番組表からのダブルクリックで、放送中番組の即時録音・未来番組の予約作成
+- 番組表からのダブルクリックで、放送中番組の即時録音・未来番組の予約作成・放送終了済み番組のタイムフリー取得
+- タイムフリー（過去7日間分の見逃し配信）ダウンロード、同時実行数の上限設定、進捗表示
 - 予約録音（1回のみ／毎週繰り返し、有効/無効の一括切り替え、複数局同時録音に対応）
-- 録音フォーマットは AAC（再エンコードなし）または MP3（ビットレート選択可）
+- 予約の失敗・取りこぼしをタイムフリーで後追いダウンロードするリカバリー機能
+- 録音フォーマットは AAC／M4A（いずれも再エンコードなし）または MP3（ビットレート選択可）
 - 録音保存先フォルダのカスタマイズ、各種設定の永続化
 
 ## 必要な環境
@@ -51,17 +53,20 @@ python src/main.py
 ```
 RecR/
 ├── src/
-│   └── main.py              # メインアプリケーション（GUI）
+│   └── main.py                 # メインアプリケーション（GUI）
 ├── utils/
-│   └── radiko_manager.py    # radiko ストリーム取得・録音・番組表・予約管理
+│   ├── radiko_manager.py       # radiko ストリーム取得・録音・タイムフリー・番組表・予約管理
+│   └── reservation_logic.py    # 予約の状態判定ロジック（タイムフリーリカバリー要否など）
+├── tests/                      # pytest によるユニットテスト
 ├── config/
-│   ├── settings.json        # アプリ設定（テーマ、既定局など）
-│   ├── reservations.json    # 予約録音データ
-│   ├── schedule_cache.json  # 番組表キャッシュ
-│   └── images/               # 番組表サムネイル画像のキャッシュ
-├── RecR.spec                # PyInstaller ビルド定義
-├── requirements.txt         # Python 依存ライブラリ
-└── README.md                 # このファイル
+│   ├── settings.json           # アプリ設定（テーマ、既定局など）
+│   ├── reservations.json       # 予約録音データ
+│   ├── schedule_cache.json     # 番組表キャッシュ
+│   └── images/                  # 番組表サムネイル画像のキャッシュ
+├── RecR.spec                   # PyInstaller ビルド定義
+├── requirements.txt            # Python 依存ライブラリ
+├── requirements-dev.txt        # 開発用依存ライブラリ（pytest など）
+└── README.md                    # このファイル
 ```
 
 ## 依存ライブラリ
@@ -89,6 +94,13 @@ pip install -r requirements.txt
 python src/main.py
 ```
 
+テストを実行する場合:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## 実行ファイルのビルド
 
 PyInstaller (`RecR.spec`) を使って単体の Windows 実行ファイルを作成できます。
@@ -109,4 +121,4 @@ MIT License。詳細は [LICENSE](LICENSE) を参照してください。
 
 ## 注記
 
-Ver0.9β（開発中）。今後、さらに機能拡張を予定しています。
+Ver1.0。今後、さらに機能拡張を予定しています。
