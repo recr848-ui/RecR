@@ -16,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import numpy as np
 import requests
 from xml.etree import ElementTree as ET
@@ -143,6 +144,17 @@ class RadikoManager:
         # 複数同時に管理する（局が異なれば並行録音でき、同じ局は多重録音しない）
         self._recordings = {}
         self._recordings_lock = threading.Lock()
+
+        # "局名|ft" -> {'thread', 'stop_event', 'output_path'} で、タイムフリーの
+        # ダウンロードをライブ録音とは別の名前空間で多重実行防止する
+        self._downloads = {}
+        self._downloads_lock = threading.Lock()
+        # タイムフリーの同時ダウンロード数の上限（GUI側の設定で1〜10に変更可能。
+        # 既定値はここ）
+        self.max_concurrent_timefree_downloads = 3
+        # 予約録音の開始・終了時刻に前後に足す余白秒数（GUI側の設定で0/15/30/45/60から
+        # 選択可能。番組表の時刻と実際の配信のわずかなズレで冒頭・末尾が欠けるのを防ぐ）
+        self.recording_margin_seconds = 0
 
         self.cache_dir = get_base_dir() / "config"
         self.cache_file = self.cache_dir / "schedule_cache.json"
@@ -276,6 +288,33 @@ class RadikoManager:
             if p.get('date_iso') and p['date_iso'] >= today_iso
         }
         return len(future_dates)
+
+    def prune_stale_schedule_cache(self):
+        """schedule_cache.json から、現在の局一覧に存在しない局名のキーを削除する
+
+        局名の表記変更（例: 大文字小文字の変更、局名の改称）があると、古い表記の
+        キーが二度と上書きされることなくキャッシュに残り続けてしまう。全局自動更新の
+        たびに、そうした孤立エントリを掃除する。タイムフリー用キー
+        （"{局名}::timefree"）も、対応する局が現在の一覧にあるかで判定する。
+
+        Returns:
+            list: 削除したキーの一覧
+        """
+        cache = self._load_cache_file()
+        current_stations = set(self.station_mapping.keys())
+
+        removed = []
+        for key in list(cache.keys()):
+            station_name = key[:-len("::timefree")] if key.endswith("::timefree") else key
+            if station_name not in current_stations:
+                removed.append(key)
+                del cache[key]
+
+        if removed:
+            self._save_cache_file(cache)
+            logger.info(f"番組表キャッシュの孤立エントリを削除しました: {', '.join(removed)}")
+
+        return removed
 
     def _image_cache_path(self, url):
         """画像URLに対応するキャッシュファイルパスを求める"""
@@ -429,10 +468,16 @@ class RadikoManager:
         """今まさに開始すべき（開始時刻を過ぎて猶予時間内であり、終了時刻はまだ来ていない）
         有効な予約録音の一覧を返す
 
+        recording_margin_seconds が設定されていれば、実際に録音すべき開始・終了時刻
+        （record_start_dt/record_end_dt）はその分だけ前後に広げる（番組表の時刻と実際の
+        配信のわずかなズレを吸収するため）。occurrence_iso（重複実行防止・状態記録に
+        使う対象日）はマージンの影響を受けない、番組本来の予定日のまま。
+
         Returns:
-            list: [(reservation_dict, start_datetime, end_datetime), ...]
+            list: [(reservation_dict, record_start_dt, record_end_dt, occurrence_iso), ...]
         """
         now = datetime.now()
+        margin = timedelta(seconds=self.recording_margin_seconds)
         due = []
         for res in self._load_reservations_file():
             if not res.get('enabled', True):
@@ -441,7 +486,8 @@ class RadikoManager:
             occurrence_date = self._reservation_occurrence_date(res, now)
             if occurrence_date is None:
                 continue
-            if res.get('last_run_date') == occurrence_date.isoformat():
+            occurrence_iso = occurrence_date.isoformat()
+            if res.get('last_run_date') == occurrence_iso:
                 continue
 
             try:
@@ -458,9 +504,12 @@ class RadikoManager:
             if end_dt <= start_dt:
                 end_dt += timedelta(days=1)
 
-            grace_end = start_dt + timedelta(seconds=self.RESERVATION_GRACE_SECONDS)
-            if start_dt <= now <= grace_end and now < end_dt:
-                due.append((res, start_dt, end_dt))
+            record_start_dt = start_dt - margin
+            record_end_dt = end_dt + margin
+
+            grace_end = record_start_dt + timedelta(seconds=self.RESERVATION_GRACE_SECONDS)
+            if record_start_dt <= now <= grace_end and now < record_end_dt:
+                due.append((res, record_start_dt, record_end_dt, occurrence_iso))
 
         return due
 
@@ -686,6 +735,23 @@ class RadikoManager:
                     return playlist_create_url
         return None
 
+    def _get_timefree_playlist_url(self, station_id):
+        """指定局のタイムフリー配信プレイリストURL（エリアフリーでない通常のタイムフリー）を1件取得する
+
+        _get_live_playlist_url と同じXMLから、timefree="1" のurl要素を見る点だけが異なる。
+        """
+        url = self.stream_list_url.format(station_id=station_id)
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+
+        for url_elem in root.findall(".//url"):
+            if url_elem.get("areafree") == "0" and url_elem.get("timefree") == "1":
+                playlist_create_url = url_elem.findtext("playlist_create_url")
+                if playlist_create_url:
+                    return playlist_create_url
+        return None
+
     # 再生開始前にためておく音声バッファ量（秒）。ネットワークの瞬断・遅延を
     # 吸収し、音切れ（アンダーラン）を減らすためのプリバッファ。
     PLAYBACK_PREBUFFER_SECONDS = 5.0
@@ -786,6 +852,176 @@ class RadikoManager:
             if stop_event.is_set():
                 return
             time.sleep(max(target_duration / 2, 1))
+
+    def _carry_over_query_params(self, source_url, target_url, keys):
+        """source_url が持つ指定キーのクエリパラメータを、target_url にコピーする
+        （target_url が既にそのキーを持っていれば上書きしない）
+        """
+        source_params = parse_qs(urlparse(source_url).query)
+        parsed_target = urlparse(target_url)
+        target_params = parse_qs(parsed_target.query)
+        for key in keys:
+            if key not in target_params and key in source_params:
+                target_params[key] = source_params[key]
+        new_query = urlencode(target_params, doseq=True)
+        return urlunparse(parsed_target._replace(query=new_query))
+
+    def _parse_medialist(self, media_text):
+        """メディアリスト(m3u8)本文から (media_sequence, target_duration, セグメント情報のlist) を返す
+
+        セグメント情報は (連番, セグメントURL, そのセグメントの#EXT-X-PROGRAM-DATE-TIME文字列
+        またはNone) のタプル。
+        """
+        media_sequence = 0
+        target_duration = 5.0
+        entries = []
+        pending_dt = None
+        index = 0
+        for line in media_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                media_sequence = int(line.split(":", 1)[1])
+            elif line.startswith("#EXT-X-TARGETDURATION:"):
+                target_duration = float(line.split(":", 1)[1])
+            elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                pending_dt = line.split(":", 1)[1]
+            elif line.startswith("#"):
+                continue
+            else:
+                entries.append((media_sequence + index, line, pending_dt))
+                index += 1
+                pending_dt = None
+        return media_sequence, target_duration, entries
+
+    def _parse_program_date_time(self, value):
+        """#EXT-X-PROGRAM-DATE-TIME の値（例: "2026-09-10T05:00:00.004+09:00"）を
+        タイムゾーン情報なしのdatetimeにして返す（radikoのft/toはJSTのローカル時刻として
+        扱っているため、比較しやすいようtzinfoを落とす）。パースできなければNone。
+        """
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    def _iter_timefree_segments(self, playlist_url, headers, stop_event, to_dt, on_progress=None):
+        """タイムフリープレイリストの全セグメント(生のAACバイト列)を順に生成するジェネレーター。
+
+        タイムフリーのmedialistは、1回の取得ではプレイリストURLのl(秒数)パラメータ分の
+        短い窓（実測でl=15なら約3セグメント分）しか返さない。radikoのタイムフリーは内部的には
+        「ftを起点に巻き戻したライブストリーム」として扱われているらしく、ライブ用の
+        _iter_live_segments と同様に medialist を繰り返しポーリングし、#EXT-X-MEDIA-SEQUENCE の
+        進みに応じて新規セグメントを取り込み続ける必要がある。
+
+        高速化のため type=c（チャンク取得）+ seek パラメータや、l を大きくする方式も
+        試したが、いずれも実機で400 Bad Requestになり使えなかった（type=b + l=15の
+        ポーリング方式のみ実機で正しいデータが取得できることを確認済み）。そのため
+        ダウンロードには放送時間相当の時間がかかる。
+
+        セグメントの#EXT-X-PROGRAM-DATE-TIMEが to_dt に達したら終了する。
+
+        on_progress (callable または None): on_progress(done, total_estimate) の形で
+        セグメント取得のたびに呼ばれる進捗コールバック（total_estimateはft〜to間の
+        推定セグメント数で、実際の総数とは多少ずれることがある）。バックグラウンドスレッドから
+        呼ばれる。
+        """
+        session = requests.Session()
+        top_res = session.get(playlist_url, headers=headers, timeout=10)
+        top_res.raise_for_status()
+
+        if "#EXTINF" in top_res.text:
+            medialist_url = playlist_url
+        else:
+            medialist_url = next(
+                line.strip() for line in top_res.text.splitlines()
+                if line.strip() and not line.startswith("#")
+            )
+            # マスタープレイリストが案内するmedialist URLは station_id と session パラメータの
+            # みで ft/to/l を含まないため、元のプレイリストURLが持っていたものを引き継ぐ
+            medialist_url = self._carry_over_query_params(
+                playlist_url, medialist_url, ('ft', 'to', 'l')
+            )
+
+        total_estimate = None
+        last_sequence = -1
+        done = 0
+        failed_count = 0
+        stall_count = 0
+        first_segment_dt = None
+
+        while not stop_event.is_set():
+            media_res = session.get(medialist_url, headers=headers, timeout=10)
+            if media_res.status_code == 404 and done > 0:
+                # CDN側のセッションには寿命があるらしく、番組の終端付近で
+                # medialistが404になることがある（実機で確認済み）。既にいくらか
+                # セグメントを取得できていれば、末尾まで到達したとみなして正常終了する。
+                logger.info(
+                    f"タイムフリー: medialistが404になりました（done={done}件）。"
+                    "セッション終了とみなして完了とします"
+                )
+                break
+            media_res.raise_for_status()
+            media_sequence, target_duration, entries = self._parse_medialist(media_res.text)
+
+            new_entries = [e for e in entries if e[0] > last_sequence]
+            if not new_entries:
+                stall_count += 1
+                if stall_count >= 10:
+                    logger.warning(
+                        f"タイムフリー: {stall_count}回連続で新規セグメントを取得できず中断しました "
+                        f"(last_sequence={last_sequence})"
+                    )
+                    return
+                if stop_event.is_set():
+                    return
+                time.sleep(max(target_duration / 2, 1))
+                continue
+            stall_count = 0
+
+            reached_end = False
+            for seq, seg_url, dt_str in new_entries:
+                seg_dt = self._parse_program_date_time(dt_str)
+                if seg_dt is not None:
+                    if first_segment_dt is None:
+                        first_segment_dt = seg_dt
+                        total_estimate = max(
+                            1, int((to_dt - first_segment_dt).total_seconds() / target_duration)
+                        )
+                        if on_progress:
+                            on_progress(0, total_estimate)
+                    if seg_dt >= to_dt:
+                        reached_end = True
+                        break
+
+                if stop_event.is_set():
+                    return
+                # セグメント本体のURLは既に認証情報が埋め込まれた署名付きURLであることが多く、
+                # ここで X-Radiko-AuthToken ヘッダーを付けると拒否されることがある
+                # （_iter_live_segments のセグメント取得も同様の理由でヘッダーなし）。
+                seg_res = session.get(seg_url, timeout=10)
+                if seg_res.status_code == 200:
+                    yield seg_res.content
+                else:
+                    failed_count += 1
+                    logger.warning(
+                        f"タイムフリーセグメント取得失敗: status={seg_res.status_code} url={seg_url}"
+                    )
+                last_sequence = seq
+                done += 1
+                if on_progress and total_estimate:
+                    on_progress(min(done, total_estimate), total_estimate)
+
+            if reached_end:
+                break
+            if stop_event.is_set():
+                return
+            time.sleep(max(target_duration / 2, 1))
+
+        logger.info(f"タイムフリー: セグメント取得完了 {done}件（失敗{failed_count}件）")
 
     def _playback_fetch_worker(self, playlist_url, auth_token, stop_event, buffer):
         """バックグラウンドスレッドでHLSストリームを取得・デコードし、PCMを
@@ -1057,10 +1293,12 @@ class RadikoManager:
         output_path = self._unique_output_path(self.output_dir / filename)
 
         stop_event = threading.Event()
+        headers = {"X-Radiko-AuthToken": auth_token}
+        segment_iter = self._iter_live_segments(playlist_url, headers, stop_event)
         thread = threading.Thread(
             target=self._recording_worker,
             args=(
-                playlist_url, auth_token, stop_event,
+                segment_iter, stop_event,
                 output_path, file_format, mp3_bitrate, duration * 60, station, on_complete,
                 metadata,
             ),
@@ -1072,6 +1310,165 @@ class RadikoManager:
             }
         thread.start()
         logger.info(f"録音開始: {station} ({duration}分, {file_format}) -> {output_path}")
+        return True, str(output_path)
+
+    def is_download_active(self, station, ft):
+        """指定局・指定開始時刻(ft)のタイムフリーダウンロードが実行中かどうか"""
+        key = f"{station}|{ft}"
+        with self._downloads_lock:
+            entry = self._downloads.get(key)
+            return bool(entry and entry['thread'].is_alive())
+
+    def is_download_limit_reached(self):
+        """タイムフリーの同時ダウンロード数が max_concurrent_timefree_downloads の
+        上限に達しているかどうか"""
+        with self._downloads_lock:
+            active = sum(1 for e in self._downloads.values() if e['thread'].is_alive())
+        return active >= self.max_concurrent_timefree_downloads
+
+    def stop_download(self, station, ft):
+        """指定局・指定開始時刻(ft)のタイムフリーダウンロードを停止する
+
+        stop_recording と同様、それまでにダウンロード済みの内容はファイルに残る
+        （_recording_worker の had_data 判定・保存処理を録音と共有しているため）。
+        """
+        key = f"{station}|{ft}"
+        with self._downloads_lock:
+            entry = self._downloads.get(key)
+
+        if entry is None:
+            return
+
+        logger.info(f"タイムフリー取得停止要求: {station} ({ft})")
+        entry['stop_event'].set()
+        if entry['thread'].is_alive():
+            entry['thread'].join(timeout=5)
+
+        with self._downloads_lock:
+            self._downloads.pop(key, None)
+
+    def stop_all_downloads(self):
+        """進行中の全てのタイムフリーダウンロードを停止する（アプリ終了時等）
+
+        stop_recording(station=None) と同様、それまでにダウンロード済みの内容は
+        ファイルに残る。
+        """
+        with self._downloads_lock:
+            targets = dict(self._downloads)
+
+        if targets:
+            logger.info(f"タイムフリー取得停止要求（全件）: {len(targets)}件")
+
+        for entry in targets.values():
+            entry['stop_event'].set()
+        for entry in targets.values():
+            if entry['thread'].is_alive():
+                entry['thread'].join(timeout=5)
+
+        with self._downloads_lock:
+            for key in targets:
+                self._downloads.pop(key, None)
+
+    def start_timefree_download(self, station, ft, to, file_format="aac", mp3_bitrate=192,
+                                 on_complete=None, on_progress=None, title=None,
+                                 filename_pattern=None, metadata=None):
+        """radikoタイムフリーで指定区間の番組をダウンロードする
+
+        Args:
+            station (str): ステーション名
+            ft (str): 取得開始時刻 "YYYYMMDDHHMMSS"
+            to (str): 取得終了時刻 "YYYYMMDDHHMMSS"
+            on_progress (callable または None): on_progress(done: int, total: int) の形で
+                セグメント取得のたびに呼ばれる進捗コールバック。バックグラウンドスレッドから
+                呼ばれるため、GUI操作を行う場合は呼び出し側でメインスレッドへのディスパッチが必要
+            その他の引数は start_recording と同じ意味。
+
+        ライブ録音（self._recordings、局名をキーに多重実行を防止）とは別の
+        名前空間（self._downloads、"局名|ft"をキー）で多重実行を防止するため、
+        同じ局のライブ録音中でもタイムフリーのダウンロードは独立して実行できる。
+
+        Returns:
+            (bool, str または None): (ダウンロード開始に成功したか, 保存先ファイルパス文字列)
+        """
+        if self.is_download_active(station, ft):
+            logger.warning(f"タイムフリー取得スキップ: {station} ({ft}) は取得中です")
+            return False, None
+
+        if self.is_download_limit_reached():
+            logger.warning(
+                f"タイムフリー取得スキップ: 同時ダウンロード数が上限"
+                f"（{self.max_concurrent_timefree_downloads}）に達しています"
+            )
+            return False, None
+
+        station_id = self.station_mapping.get(station)
+        if not station_id:
+            logger.warning(f"タイムフリー取得失敗: 局が見つかりません ({station})")
+            return False, None
+
+        if file_format not in self.RECORDING_FORMATS:
+            logger.warning(f"タイムフリー取得失敗: 未対応のフォーマットです ({file_format})")
+            return False, None
+
+        try:
+            auth_token = self._ensure_authenticated()
+            playlist_base_url = self._get_timefree_playlist_url(station_id)
+        except Exception:
+            logger.exception(f"Error preparing timefree download for {station}")
+            return False, None
+
+        if not playlist_base_url:
+            return False, None
+
+        # start_at/end_at と ft/to の両方を送る必要がある（streamlinkのradikoプラグイン実装が
+        # 典拠。ft/toだけだとCDNのセッションに時間範囲が紐付かず、常に現在時刻付近の
+        # ライブ相当の内容が返ってきてしまうことを実機で確認した）。
+        # l は medialist が1回のリクエストで返す秒数の上限らしいが、大きい値（例: 600）を
+        # 送ると400 Bad Requestになることを実機で確認したため、動作確認済みの15固定とする。
+        # type=c（チャンク取得）+ seek での高速化も試したが実機で400になったため type=b のまま。
+        to_dt = datetime.strptime(to, "%Y%m%d%H%M%S")
+        lsid = uuid.uuid4().hex
+        playlist_url = (
+            f"{playlist_base_url}?station_id={station_id}&start_at={ft}&ft={ft}"
+            f"&end_at={to}&to={to}&l=15&lsid={lsid}&type=b"
+        )
+
+        # ファイル名の日時には、ダウンロードした時刻ではなく放送開始時刻(ft)を使う
+        # （タイムフリーは後から取得するものなので、いつ聴いたかではなく、いつ放送された
+        # 番組かがファイル名から分かるようにする）
+        ft_dt = datetime.strptime(ft, "%Y%m%d%H%M%S")
+        ext = {"aac": "aac", "m4a": "m4a"}.get(file_format, "mp3")
+        filename = self._build_recording_filename(
+            filename_pattern or self.DEFAULT_FILENAME_PATTERN, station, title, ft_dt, ext
+        )
+        output_path = self._unique_output_path(self.output_dir / filename)
+
+        stop_event = threading.Event()
+        headers = {"X-Radiko-AuthToken": auth_token}
+        segment_iter = self._iter_timefree_segments(
+            playlist_url, headers, stop_event, to_dt, on_progress=on_progress
+        )
+        registry_key = f"{station}|{ft}"
+        thread = threading.Thread(
+            target=self._recording_worker,
+            args=(
+                segment_iter, stop_event,
+                output_path, file_format, mp3_bitrate, None, station, on_complete,
+                metadata,
+            ),
+            kwargs={
+                'registry': self._downloads,
+                'registry_lock': self._downloads_lock,
+                'registry_key': registry_key,
+            },
+            daemon=True,
+        )
+        with self._downloads_lock:
+            self._downloads[registry_key] = {
+                'thread': thread, 'stop_event': stop_event, 'output_path': output_path
+            }
+        thread.start()
+        logger.info(f"タイムフリー取得開始: {station} ({ft}-{to}, {file_format}) -> {output_path}")
         return True, str(output_path)
 
     def _write_metadata_tags(self, output_path, file_format, metadata):
@@ -1140,10 +1537,11 @@ class RadikoManager:
 
         tags.save(output_path, v2_version=3)
 
-    def _recording_worker(self, playlist_url, auth_token, stop_event,
+    def _recording_worker(self, segment_iter, stop_event,
                            output_path, file_format, mp3_bitrate, duration_seconds, station,
-                           on_complete=None, metadata=None):
-        """バックグラウンドスレッドでライブ配信をファイルに保存する
+                           on_complete=None, metadata=None, registry=None, registry_lock=None,
+                           registry_key=None):
+        """バックグラウンドスレッドで配信をファイルに保存する（ライブ録音・タイムフリー共通）
 
         file_format="aac" の場合は取得したAAC(ADTS)の生バイト列をそのまま連結して
         書き出す（再エンコードなし・音質劣化なし）。
@@ -1153,6 +1551,16 @@ class RadikoManager:
         file_format="mp3" の場合はデコードしてlibmp3lameで再エンコードする。
         いずれの場合もデコードした音声からグラフィックイコライザー用レベルは更新する。
 
+        segment_iter はセグメントの生バイト列を順に返すイテレーター
+        （ライブなら _iter_live_segments、タイムフリーなら _iter_timefree_segments）。
+        duration_seconds が指定されていればその時間経過で打ち切る（ライブ録音用）。
+        None ならセグメントを取得し尽くすまで（タイムフリーは配信自体が有限のため
+        イテレーターが自然に終わる）。
+
+        registry/registry_key は多重実行防止用の辞書とそのキー
+        （ライブ録音は self._recordings、タイムフリーは self._downloads）。
+        未指定なら self._recordings と station を使う。
+
         認証切れ・通信エラー等でセグメントを1つも取得できなかった場合、
         例外はこの関数内で捕捉されるだけで呼び出し元には伝わらないため、
         出力ファイルが実質空のまま「録音成功」に見えてしまう。on_complete を
@@ -1161,7 +1569,13 @@ class RadikoManager:
         """
         import av
 
-        headers = {"X-Radiko-AuthToken": auth_token}
+        if registry is None:
+            registry = self._recordings
+        if registry_lock is None:
+            registry_lock = self._recordings_lock
+        if registry_key is None:
+            registry_key = station
+
         start_time = time.monotonic()
         raw_file = None
         output_container = None
@@ -1177,7 +1591,7 @@ class RadikoManager:
             else:
                 output_container = av.open(str(output_path), mode="w")
 
-            for segment_bytes in self._iter_live_segments(playlist_url, headers, stop_event):
+            for segment_bytes in segment_iter:
                 container = av.open(io.BytesIO(segment_bytes), format="aac")
                 try:
                     audio_stream = container.streams.audio[0]
@@ -1265,8 +1679,8 @@ class RadikoManager:
             with self._levels_lock:
                 self._levels = [0.0] * self.EQ_NUM_BANDS
                 self._lr_levels = [0.0, 0.0]
-            with self._recordings_lock:
-                self._recordings.pop(station, None)
+            with registry_lock:
+                registry.pop(registry_key, None)
             if error_message:
                 logger.warning(f"録音終了: {station} -> {output_path} (エラー: {error_message})")
             else:
@@ -1319,6 +1733,73 @@ class RadikoManager:
 
     WEEKDAY_JA = ['月', '火', '水', '木', '金', '土', '日']
 
+    def _fetch_day_programs(self, station_id, target_date):
+        """指定局・指定日（datetime）1日分の番組表を取得してパースする
+
+        get_program_schedule（未来方向）と get_timefree_schedule（過去方向）の
+        どちらからも呼ばれる共通処理。番組表APIのURL構築・XMLパースは対象日の
+        前後に関わらず同じ形式のため、日付計算部分だけを呼び出し元で変える。
+
+        Returns:
+            list: get_program_schedule と同じ形式の辞書のリスト（取得失敗時は空リスト）
+        """
+        date_str = target_date.strftime("%Y%m%d")
+        date_label = f"{target_date.month}/{target_date.day}({self.WEEKDAY_JA[target_date.weekday()]})"
+        date_iso = target_date.strftime("%Y-%m-%d")
+
+        url = f"{self.radiko_api_url}/{date_str}/{station_id}.xml"
+        programs = []
+
+        try:
+            for attempt in range(2):
+                try:
+                    response = requests.get(url, timeout=8)
+                    break
+                except requests.exceptions.RequestException:
+                    if attempt == 0:
+                        continue
+                    raise
+            response.encoding = 'utf-8'
+
+            if response.status_code == 200:
+                root = ET.fromstring(response.content)
+
+                # 各番組情報を抽出
+                for program in root.findall(".//prog"):
+                    start = program.get("ft", "")
+                    end = program.get("to", "")
+                    title = program.findtext("title", "不明な番組")
+                    desc = program.findtext("desc", "")
+                    info = program.findtext("info", "")
+                    pfm = program.findtext("pfm", "")
+                    img = program.findtext("img", "")
+
+                    # 時刻をフォーマット（ft/to は YYYYMMDDHHmmss 形式）
+                    try:
+                        start_dt = datetime.strptime(start, "%Y%m%d%H%M%S")
+                        end_dt = datetime.strptime(end, "%Y%m%d%H%M%S")
+                        start_time = start_dt.strftime("%H:%M")
+                        end_time = end_dt.strftime("%H:%M")
+                    except ValueError:
+                        start_time = start
+                        end_time = end
+
+                    programs.append({
+                        'date': date_label,
+                        'date_iso': date_iso,
+                        'start': start_time,
+                        'end': end_time,
+                        'title': title,
+                        'desc': desc,
+                        'info': info,
+                        'pfm': pfm,
+                        'img': img
+                    })
+        except Exception:
+            logger.exception(f"Error fetching schedule for {date_str}")
+
+        return programs
+
     def get_program_schedule(self, station_name, days=10):
         """ラジコから番組表を取得
 
@@ -1355,67 +1836,45 @@ class RadikoManager:
             # 今日から指定日数分の番組表を取得
             for day_offset in range(days):
                 target_date = now + timedelta(days=day_offset)
-                date_str = target_date.strftime("%Y%m%d")
-                date_label = f"{target_date.month}/{target_date.day}({self.WEEKDAY_JA[target_date.weekday()]})"
-                date_iso = target_date.strftime("%Y-%m-%d")
-
-                # 番組表APIのエンドポイント
-                url = f"{self.radiko_api_url}/{date_str}/{station_id}.xml"
-
-                try:
-                    for attempt in range(2):
-                        try:
-                            response = requests.get(url, timeout=8)
-                            break
-                        except requests.exceptions.RequestException:
-                            if attempt == 0:
-                                continue
-                            raise
-                    response.encoding = 'utf-8'
-
-                    if response.status_code == 200:
-                        root = ET.fromstring(response.content)
-
-                        # 各番組情報を抽出
-                        for program in root.findall(".//prog"):
-                            start = program.get("ft", "")
-                            end = program.get("to", "")
-                            title = program.findtext("title", "不明な番組")
-                            desc = program.findtext("desc", "")
-                            info = program.findtext("info", "")
-                            pfm = program.findtext("pfm", "")
-                            img = program.findtext("img", "")
-
-                            # 時刻をフォーマット（ft/to は YYYYMMDDHHmmss 形式）
-                            try:
-                                start_dt = datetime.strptime(start, "%Y%m%d%H%M%S")
-                                end_dt = datetime.strptime(end, "%Y%m%d%H%M%S")
-                                start_time = start_dt.strftime("%H:%M")
-                                end_time = end_dt.strftime("%H:%M")
-                            except ValueError:
-                                start_time = start
-                                end_time = end
-
-                            programs.append({
-                                'date': date_label,
-                                'date_iso': date_iso,
-                                'start': start_time,
-                                'end': end_time,
-                                'title': title,
-                                'desc': desc,
-                                'info': info,
-                                'pfm': pfm,
-                                'img': img
-                            })
-                except Exception:
-                    logger.exception(f"Error fetching schedule for {date_str}")
-                    continue
+                programs.extend(self._fetch_day_programs(station_id, target_date))
 
             logger.info(f"番組表取得完了: {station_name} ({len(programs)}件)")
             return programs
 
         except Exception:
             logger.exception(f"Error in get_program_schedule: {station_name}")
+            return []
+
+    def get_timefree_schedule(self, station_name, days_back=7):
+        """ラジコのタイムフリー対象期間（過去 days_back 日分、当日を含む）の番組表を取得
+
+        Args:
+            station_name (str): ステーション名
+            days_back (int): 遡る日数（デフォルト7日。radikoのタイムフリーは
+                放送から概ね1週間で聴取期限が切れるため）
+
+        Returns:
+            list: get_program_schedule と同じ形式の辞書のリスト
+        """
+        logger.info(f"タイムフリー番組表取得開始: {station_name} (過去{days_back}日分)")
+        try:
+            station_id = self.station_mapping.get(station_name)
+            if not station_id:
+                logger.warning(f"タイムフリー番組表取得失敗: 局が見つかりません ({station_name})")
+                return []
+
+            programs = []
+            now = datetime.now()
+
+            for day_offset in range(days_back):
+                target_date = now - timedelta(days=day_offset)
+                programs.extend(self._fetch_day_programs(station_id, target_date))
+
+            logger.info(f"タイムフリー番組表取得完了: {station_name} ({len(programs)}件)")
+            return programs
+
+        except Exception:
+            logger.exception(f"Error in get_timefree_schedule: {station_name}")
             return []
 
     def get_sample_schedule(self, station_name, days=10):

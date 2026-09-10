@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.app_logger import setup_logging
 from utils.radiko_manager import RadikoManager, keyword_matches
+from utils import reservation_logic
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -89,7 +90,13 @@ class RecRApp:
         else:
             default_station = "NHK-FM" if "NHK-FM" in stations else (stations[0] if stations else "")
         self.default_station_var = tk.StringVar(value=default_station)
-        self.station_var = tk.StringVar(value=default_station)
+        # 「再生中」「録音タブでの手動録音対象」「番組表タブで閲覧中」は、それぞれ別の局を
+        # 同時に扱えるよう独立した変数にする（連動させると、何を聞いていて何を録音していて
+        # 何の番組表を見ているか分からなくなるため）
+        self.playback_station_var = tk.StringVar(value=default_station)
+        self.recording_station_var = tk.StringVar(value=default_station)
+        self.schedule_station_var = tk.StringVar(value=default_station)
+        self.schedule_mode_var = tk.StringVar(value='upcoming')
 
         self.SCHEDULE_FETCH_DAYS = settings.get('schedule_fetch_days', self.SCHEDULE_FETCH_DAYS)
         self.SCHEDULE_STALE_THRESHOLD_DAYS = settings.get(
@@ -98,6 +105,13 @@ class RecRApp:
         self.FULL_SCHEDULE_REFRESH_TIME = settings.get(
             'full_schedule_refresh_time', self.FULL_SCHEDULE_REFRESH_TIME
         )
+        self.manager.max_concurrent_timefree_downloads = settings.get(
+            'max_concurrent_timefree_downloads', self.manager.max_concurrent_timefree_downloads
+        )
+        self.manager.recording_margin_seconds = settings.get(
+            'recording_margin_seconds', self.manager.recording_margin_seconds
+        )
+        self.recording_margin_var = tk.IntVar(value=self.manager.recording_margin_seconds)
 
         self._busy_saved_states = {}
         self._reservation_check_job = None
@@ -107,6 +121,11 @@ class RecRApp:
         # 局名 -> {'title', 'start_dt', 'end_dt'}。手動・予約を問わず、現在進行中の
         # 全ての録音を右上のパネルに表示するための情報
         self._active_recordings = {}
+        # "局名|ft" -> {'station', 'title', 'done', 'total'}。進行中のタイムフリー
+        # ダウンロードを右上のパネルに進捗付きで表示するための情報
+        self._active_downloads = {}
+        # ダウンロードの進捗ラベルを、パネル全体を再構築せず直接書き換えるための参照
+        self._download_progress_labels = {}
         self._tray_icon = None
         self._tray_hint_shown = settings.get('tray_hint_shown', False)
         self._sleep_prevented = False
@@ -117,6 +136,7 @@ class RecRApp:
         self._schedule_reservation_check()
         self._schedule_reservation_list_minute_refresh()
         self._check_full_schedule_refresh_due()
+        self.root.after(1500, self._notify_missed_reservations_on_startup)
 
     def on_close_button(self):
         """ウィンドウの×ボタン: アプリを終了せず、タスクトレイへ最小化する"""
@@ -207,11 +227,19 @@ class RecRApp:
         録音中であれば、中断されることを確認してから終了する。
         了承が得られたら、再生中・録音中の処理を停止してから終了する
         """
-        if self._active_recordings:
-            stations = "、".join(sorted(self._active_recordings))
+        if self._active_recordings or self._active_downloads:
+            parts = []
+            if self._active_recordings:
+                parts.append(f"録音中（{'、'.join(sorted(self._active_recordings))}）")
+            if self._active_downloads:
+                titles = "、".join(
+                    f"{e['station']}「{e['title']}」" for e in self._active_downloads.values()
+                )
+                parts.append(f"タイムフリー取得中（{titles}）")
             if not messagebox.askyesno(
                 "終了確認",
-                f"現在録音中です（{stations}）。\n終了すると録音が中断されます。終了してもよろしいですか？"
+                f"現在{'・'.join(parts)}です。\n"
+                "終了すると中断されます。終了してもよろしいですか？"
             ):
                 return
         self._hide_tray_icon()
@@ -235,6 +263,7 @@ class RecRApp:
             self._full_refresh_check_job = None
         self.manager.stop_playback()
         self.manager.stop_recording()
+        self.manager.stop_all_downloads()
         self.root.destroy()
 
     def setup_ui(self):
@@ -276,13 +305,13 @@ class RecRApp:
         ttk.Label(top_bar, text="ステーション：").pack(side=tk.LEFT)
         top_bar_station_combo = ttk.Combobox(
             top_bar,
-            textvariable=self.station_var,
+            textvariable=self.playback_station_var,
             values=self.manager.get_stations(),
             state="readonly",
             width=14
         )
         top_bar_station_combo.pack(side=tk.LEFT, padx=(5, 15))
-        top_bar_station_combo.bind("<<ComboboxSelected>>", self.on_station_changed)
+        self.top_bar_station_combo = top_bar_station_combo
 
         self.play_button = ttk.Button(
             top_bar,
@@ -534,7 +563,8 @@ class RecRApp:
         for bitrate in self.manager.MP3_BITRATE_CHOICES:
             quality_menu.add_radiobutton(
                 label=f"MP3ビットレート: {bitrate}kbps",
-                variable=self.bitrate_var, value=str(bitrate)
+                variable=self.bitrate_var, value=str(bitrate),
+                command=self._on_bitrate_changed
             )
         settings_menu.add_cascade(label="録音品質", menu=quality_menu)
 
@@ -573,6 +603,20 @@ class RecRApp:
         settings_menu.add_command(
             label="全局自動更新の時刻...", command=self._change_full_schedule_refresh_time
         )
+        settings_menu.add_command(
+            label="タイムフリー同時ダウンロード数...",
+            command=self._change_max_concurrent_timefree_downloads
+        )
+
+        margin_menu = tk.Menu(settings_menu, tearoff=0)
+        margin_labels = {0: "なし", 15: "15秒", 30: "30秒", 45: "45秒", 60: "60秒"}
+        for seconds, label in margin_labels.items():
+            margin_menu.add_radiobutton(
+                label=label, variable=self.recording_margin_var,
+                value=seconds, command=self._on_recording_margin_changed
+            )
+        settings_menu.add_cascade(label="予約録音の前後マージン", menu=margin_menu)
+
         settings_menu.add_separator()
         settings_menu.add_checkbutton(
             label="予約待機中・録音中は自動スリープを抑止する",
@@ -588,7 +632,7 @@ class RecRApp:
         sv_ttk.set_theme(theme)
         self.manager.save_settings({'theme': theme})
         self._apply_canvas_theme()
-        self.display_schedule(self._current_programs)
+        self.display_schedule(self._current_programs, mode=self.schedule_mode_var.get())
 
     def _apply_canvas_theme(self):
         """ttkテーマの管理外であるtk.Canvasの背景色を、現在のテーマに合わせて更新する"""
@@ -716,6 +760,29 @@ class RecRApp:
         self._center_dialog_over_parent(dialog)
         dialog.deiconify()
 
+    def _change_max_concurrent_timefree_downloads(self):
+        """タイムフリーの同時ダウンロード数の上限を変更する（1〜10、既定3）"""
+        value = self._ask_integer_ja(
+            "タイムフリー同時ダウンロード数",
+            "タイムフリーを同時にいくつまでダウンロードできるようにしますか？（1〜10）",
+            initialvalue=self.manager.max_concurrent_timefree_downloads,
+            minvalue=1, maxvalue=10
+        )
+        if value is None:
+            return
+        self.manager.max_concurrent_timefree_downloads = value
+        self.manager.save_settings({'max_concurrent_timefree_downloads': value})
+
+    def _on_recording_margin_changed(self):
+        """予約録音の前後マージン変更時: 設定を保存する
+
+        番組表の時刻と実際の配信のわずかなズレで、予約録音の冒頭・末尾が
+        欠けてしまうのを防ぐため、開始前・終了後にこの秒数だけ余分に録音する。
+        """
+        seconds = self.recording_margin_var.get()
+        self.manager.recording_margin_seconds = seconds
+        self.manager.save_settings({'recording_margin_seconds': seconds})
+
     def _ask_integer_ja(self, title, prompt, initialvalue, minvalue, maxvalue):
         """整数入力ダイアログ（エラーメッセージを日本語で表示する）"""
         value = initialvalue
@@ -799,13 +866,12 @@ class RecRApp:
         ttk.Label(station_frame, text="ステーション：").grid(row=0, column=0, sticky=tk.W)
         station_combo = ttk.Combobox(
             station_frame,
-            textvariable=self.station_var,
+            textvariable=self.recording_station_var,
             values=self.manager.get_stations(),
             state="readonly"
         )
         station_combo.grid(row=0, column=1, sticky=tk.EW, padx=5)
         station_frame.columnconfigure(1, weight=1)
-        station_combo.bind("<<ComboboxSelected>>", self.on_station_changed)
 
         # 録音時間フレーム
         duration_frame = ttk.LabelFrame(parent, text="録音設定", padding=10)
@@ -822,8 +888,10 @@ class RecRApp:
         duration_spin.grid(row=0, column=1, sticky=tk.EW, padx=5)
         duration_frame.columnconfigure(1, weight=1)
 
+        settings = self.manager.load_settings()
+
         ttk.Label(duration_frame, text="ファイル形式:").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
-        self.format_var = tk.StringVar(value="aac")
+        self.format_var = tk.StringVar(value=settings.get('recording_format', 'aac'))
         format_combo = ttk.Combobox(
             duration_frame,
             textvariable=self.format_var,
@@ -835,7 +903,7 @@ class RecRApp:
         format_combo.bind("<<ComboboxSelected>>", self._on_format_changed)
 
         self.bitrate_label = ttk.Label(duration_frame, text="MP3ビットレート:")
-        self.bitrate_var = tk.StringVar(value="192")
+        self.bitrate_var = tk.StringVar(value=settings.get('mp3_bitrate', '192'))
         self.bitrate_combo = ttk.Combobox(
             duration_frame,
             textvariable=self.bitrate_var,
@@ -843,7 +911,8 @@ class RecRApp:
             state="readonly",
             width=10
         )
-        self._set_bitrate_widgets_visible(False)
+        self.bitrate_combo.bind("<<ComboboxSelected>>", self._on_bitrate_changed)
+        self._set_bitrate_widgets_visible(self.format_var.get() == "mp3")
 
         # ボタンフレーム
         button_frame = ttk.Frame(parent)
@@ -886,8 +955,13 @@ class RecRApp:
         status_label.pack(pady=10)
 
     def _on_format_changed(self, event=None):
-        """ファイル形式コンボボックス変更時: MP3のときだけビットレート選択を表示"""
+        """ファイル形式コンボボックス変更時: MP3のときだけビットレート選択を表示し、設定を保存する"""
         self._set_bitrate_widgets_visible(self.format_var.get() == "mp3")
+        self.manager.save_settings({'recording_format': self.format_var.get()})
+
+    def _on_bitrate_changed(self, event=None):
+        """MP3ビットレート変更時: 設定を保存する"""
+        self.manager.save_settings({'mp3_bitrate': self.bitrate_var.get()})
 
     def _set_bitrate_widgets_visible(self, visible):
         if visible:
@@ -906,13 +980,13 @@ class RecRApp:
         ttk.Label(control_frame, text="ステーション：").pack(side=tk.LEFT)
         station_combo = ttk.Combobox(
             control_frame,
-            textvariable=self.station_var,
+            textvariable=self.schedule_station_var,
             values=self.manager.get_stations(),
             state="readonly",
             width=14
         )
         station_combo.pack(side=tk.LEFT, padx=5)
-        station_combo.bind("<<ComboboxSelected>>", self.on_station_changed)
+        station_combo.bind("<<ComboboxSelected>>", self.on_schedule_station_changed)
 
         area_id, area_name = self.manager.get_area_info()
         area_text = f"エリア: {area_name}（{area_id}）" if area_id else "エリア: 判定失敗（関東の局一覧を表示中）"
@@ -923,6 +997,15 @@ class RecRApp:
             text="番組表を取得",
             command=self.load_schedule
         ).pack(side=tk.LEFT, padx=5)
+
+        ttk.Radiobutton(
+            control_frame, text="番組表", variable=self.schedule_mode_var,
+            value="upcoming", command=self.on_schedule_mode_changed
+        ).pack(side=tk.LEFT, padx=(15, 0))
+        ttk.Radiobutton(
+            control_frame, text="過去7日間（タイムフリー）", variable=self.schedule_mode_var,
+            value="timefree", command=self.on_schedule_mode_changed
+        ).pack(side=tk.LEFT, padx=(5, 0))
 
         self.search_toggle_button = ttk.Button(
             control_frame,
@@ -1110,8 +1193,8 @@ class RecRApp:
 
     def _jump_to_program(self, station, program):
         """検索結果クリック時: 対象局に切り替え、該当番組までスクロールして強調表示"""
-        if self.station_var.get() != station:
-            self.station_var.set(station)
+        if self.schedule_station_var.get() != station:
+            self.schedule_station_var.set(station)
             self.load_schedule_for_current_station()
         self.root.after(50, lambda: self._highlight_program(program))
 
@@ -1146,31 +1229,14 @@ class RecRApp:
     def _program_actual_date_iso(self, date_iso, start_hhmm):
         """番組の date_iso（放送日、5:00始まり）と start（HH:MM）から、
         実際のカレンダー上の日付を求める（0-4時台の番組は翌カレンダー日になるため）
+
+        ロジック本体は utils.reservation_logic（GUI非依存、単体テスト対象）に切り出してある。
         """
-        try:
-            target_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
-            hour = int(start_hhmm.split(":")[0])
-        except (ValueError, AttributeError, IndexError):
-            return date_iso
-        if hour < 5:
-            target_date += timedelta(days=1)
-        return target_date.strftime("%Y-%m-%d")
+        return reservation_logic.program_actual_date_iso(date_iso, start_hhmm)
 
     def _program_air_window(self, program):
         """番組の実際の放送開始・終了datetimeを求める（不正なデータならNone, None）"""
-        date_iso = program.get('date_iso') or datetime.now().strftime("%Y-%m-%d")
-        start = program.get('start') or ''
-        end = program.get('end') or ''
-        actual_date_iso = self._program_actual_date_iso(date_iso, start)
-        try:
-            base_date = datetime.strptime(actual_date_iso, "%Y-%m-%d").date()
-            start_dt = datetime.combine(base_date, datetime.strptime(start, "%H:%M").time())
-            end_dt = datetime.combine(base_date, datetime.strptime(end, "%H:%M").time())
-        except ValueError:
-            return None, None
-        if end_dt <= start_dt:
-            end_dt += timedelta(days=1)
-        return start_dt, end_dt
+        return reservation_logic.program_air_window(program)
 
     def _find_now_airing_program(self, station):
         """指定局のキャッシュ済み番組表から、現在放送中の番組情報を探す（無ければNone）
@@ -1220,8 +1286,7 @@ class RecRApp:
         """番組表で番組をダブルクリックした時の処理
 
         現在放送中の番組であれば、予約ではなく「今すぐ録音するか」を確認するダイアログを出す。
-        すでに終了した過去の番組は、RecRがタイムフリー（過去放送のダウンロード）に
-        対応していないため録音できない旨を伝えるだけで何もしない。
+        すでに終了した過去の番組（当日内で放送済みのもの）は、タイムフリーの取得確認ダイアログを開く。
         それ以外（未来の番組）は、その番組の内容を入力済みの状態で新規予約録音ダイアログを開く。
         """
         now = datetime.now()
@@ -1231,19 +1296,14 @@ class RecRApp:
             return
 
         if end_dt and end_dt <= now:
-            messagebox.showinfo(
-                "録音できません",
-                f"「{program.get('title', '')}」はすでに放送を終了しています。\n"
-                "RecR はタイムフリー（過去の放送のダウンロード）には対応していないため、"
-                "録音できません。"
-            )
+            self._open_timefree_download_dialog(program)
             return
 
         date_iso = program.get('date_iso') or datetime.now().strftime("%Y-%m-%d")
         start = program.get('start') or '00:00'
         end = program.get('end') or '01:00'
         prefill = {
-            'station': self.station_var.get(),
+            'station': self.schedule_station_var.get(),
             'repeat': 'once',
             'date_iso': self._program_actual_date_iso(date_iso, start),
             'start': start,
@@ -1259,7 +1319,7 @@ class RecRApp:
         使わず、局ごとに独立して追跡する_watch_background_recordingに任せる。
         こうすることで、複数局を続けて「今すぐ録音」しても互いを上書きしない。
         """
-        station = self.station_var.get()
+        station = self.schedule_station_var.get()
         title = program.get('title') or station
         if not messagebox.askyesno(
             "録音", f"「{title}」は現在放送中です。今すぐ録音を開始しますか？"
@@ -1298,6 +1358,124 @@ class RecRApp:
                 f"{station} の録音を開始できませんでした。\n通信状況をご確認ください。"
             )
 
+    def _open_timefree_download_dialog(self, program, station=None, on_success=None):
+        """過去の番組をダブルクリックした時: 確認の上、タイムフリーでダウンロードする
+
+        radikoのタイムフリーは放送から概ね1週間で聴取期限が切れるため、
+        それを過ぎている番組はダウンロードできない旨を伝えて何もしない。
+
+        station を指定しない場合は番組表タブで選択中の局を対象にする
+        （予約一覧からは、予約自身の局を明示的に渡す）。
+        on_success（callable または None）は、データを1バイト以上取得できて
+        エラーなく完了した場合にのみ呼ばれる（予約一覧からの呼び出しで、
+        対象予約を「DL済」にする用途）。
+        """
+        station = station or self.schedule_station_var.get()
+        title = program.get('title') or station
+        start_dt, end_dt = self._program_air_window(program)
+        if not start_dt or not end_dt:
+            messagebox.showinfo("タイムフリー", "この番組の時刻情報を取得できませんでした。")
+            return
+
+        now = datetime.now()
+        if now - end_dt > timedelta(days=7):
+            messagebox.showinfo(
+                "タイムフリー",
+                f"「{title}」はタイムフリーの聴取期限（放送から約1週間）を過ぎているため、"
+                "取得できません。"
+            )
+            return
+
+        if self.manager.is_download_limit_reached():
+            messagebox.showinfo(
+                "タイムフリー",
+                "タイムフリーの同時ダウンロード数が上限"
+                f"（{self.manager.max_concurrent_timefree_downloads}件）に達しています。\n"
+                "他のダウンロードが終わってから、もう一度お試しください。\n"
+                "上限は「設定」メニューから変更できます。"
+            )
+            return
+
+        if not messagebox.askyesno(
+            "タイムフリー", f"「{title}」をタイムフリーでダウンロードしますか？"
+        ):
+            return
+
+        ft = start_dt.strftime("%Y%m%d%H%M%S")
+        to = end_dt.strftime("%Y%m%d%H%M%S")
+        if self.manager.is_download_active(station, ft):
+            messagebox.showerror("エラー", f"{station} のこの番組は既に取得中です")
+            return
+
+        file_format = self.format_var.get()
+        try:
+            mp3_bitrate = int(self.bitrate_var.get())
+        except ValueError:
+            mp3_bitrate = 192
+
+        key = f"{station}|{ft}"
+        self._register_active_download(key, station, ft, title)
+
+        self._set_app_busy(True)
+        try:
+            success, output_path = self.manager.start_timefree_download(
+                station, ft, to, file_format=file_format, mp3_bitrate=mp3_bitrate,
+                title=title, filename_pattern=self.filename_pattern_var.get(),
+                metadata=self._build_recording_metadata(station, program=program, fallback_title=title),
+                on_progress=lambda done, total, k=key: self.root.after(
+                    0, self._update_active_download_progress, k, done, total
+                ),
+                on_complete=lambda had_data, path, error, k=key, st=station, t=title: self.root.after(
+                    0, self._on_timefree_download_complete, k, st, t, had_data, path, error, on_success
+                )
+            )
+        finally:
+            self._set_app_busy(False)
+
+        if not success:
+            self._unregister_active_download(key)
+            messagebox.showerror(
+                "タイムフリー",
+                f"{station} の「{title}」を取得できませんでした。\n通信状況をご確認ください。"
+            )
+
+    def _on_timefree_download_complete(self, key, station, title, had_data, output_path, error,
+                                        on_success=None):
+        """タイムフリーのダウンロード終了時（メインスレッドから呼ばれる）:
+        データを1バイトも取得できなかった場合に警告する
+
+        on_success は、データを取得できてエラーもなかった場合にのみ呼ぶ
+        （途中で通信エラーが起きた場合は「完了できた」とは見なさない）。
+        """
+        self._unregister_active_download(key)
+        if hasattr(self, 'files_tree'):
+            self._refresh_files_list()
+        if not had_data:
+            detail = f"\n（{error}）" if error else ""
+            message = (
+                f"{station} の「{title}」のタイムフリー取得でデータを取得できませんでした"
+                f"（ファイルが空です）。\n通信状況をご確認ください。{detail}"
+            )
+            if self._tray_icon is not None:
+                self._notify_via_tray("タイムフリー", message)
+            else:
+                messagebox.showwarning("タイムフリー", message)
+        elif error:
+            message = (
+                f"{station} の「{title}」のタイムフリー取得は途中で通信エラーが発生し、中断されました。\n"
+                f"それまでの内容は保存されています。\n"
+                f"保存先: {output_path}\n（{error}）"
+            )
+            if self._tray_icon is not None:
+                self._notify_via_tray("タイムフリー", message)
+            else:
+                messagebox.showwarning("タイムフリー", message)
+        else:
+            if self._tray_icon is not None:
+                self._notify_via_tray("タイムフリー", f"{station} の「{title}」の取得が完了しました。")
+            if on_success is not None:
+                on_success()
+
     def _sort_treeview_column(self, tree, col, reverse):
         """Treeviewの列見出しクリックで、その列の値に基づき行を並べ替える
         （再クリックで昇順・降順を反転）。
@@ -1331,20 +1509,24 @@ class RecRApp:
             control_frame, text="削除", command=self._delete_selected_reservation
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
+            control_frame, text="終了した予約を削除", command=self._delete_finished_reservations
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
             control_frame, text="録音を停止", command=self._stop_selected_reservation_recording
         ).pack(side=tk.LEFT, padx=5)
 
         list_frame = ttk.Frame(parent, padding=(10, 0, 10, 10))
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("enabled", "station", "schedule", "time", "title", "source", "status")
+        columns = ("enabled", "station", "schedule", "time", "title", "source", "status", "download")
         headings = {
             "enabled": "有効", "station": "局", "schedule": "日付/繰り返し",
-            "time": "時刻", "title": "番組名", "source": "由来", "status": "状態"
+            "time": "時刻", "title": "番組名", "source": "由来", "status": "状態",
+            "download": "タイムフリー"
         }
         widths = {
-            "enabled": 50, "station": 90, "schedule": 120,
-            "time": 110, "title": 260, "source": 120, "status": 80
+            "enabled": 36, "station": 90, "schedule": 120,
+            "time": 110, "title": 240, "source": 120, "status": 80, "download": 90
         }
         # Ctrl/Shiftクリックで複数選択し、まとめて有効化・無効化・削除できるようにする
         tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
@@ -1357,6 +1539,7 @@ class RecRApp:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.LEFT, fill=tk.Y)
         tree.bind("<Double-1>", lambda e: self._edit_selected_reservation())
+        tree.bind("<Button-1>", self._on_reservation_tree_click)
 
         self.reservation_tree = tree
         self._reservation_row_map = {}
@@ -1377,6 +1560,8 @@ class RecRApp:
 
             if self.manager.is_recording_active(res.get('station')):
                 status_text = "録音中"
+            elif res.get('timefree_downloaded'):
+                status_text = "DL済"
             elif res.get('last_result') == 'success':
                 status_text = "成功"
             elif res.get('last_result') == 'partial':
@@ -1392,6 +1577,8 @@ class RecRApp:
             else:
                 source_text = "手動"
 
+            download_text = "⬇ ダウンロード" if self._reservation_needs_timefree_recovery(res) else ""
+
             item_id = tree.insert(
                 "", tk.END,
                 values=(
@@ -1401,10 +1588,95 @@ class RecRApp:
                     f"{res.get('start', '')}-{res.get('end', '')}",
                     res.get('title', ''),
                     source_text,
-                    status_text
+                    status_text,
+                    download_text
                 )
             )
             self._reservation_row_map[item_id] = res.get('id')
+
+    def _reservation_occurrence_program_dict(self, reservation):
+        """予約の直近の回（1回のみならその日、毎週なら直近のその曜日の日）を、
+        _program_air_window 等が扱える「番組」風の辞書にして返す（計算できなければNone）
+        """
+        return reservation_logic.reservation_occurrence_program_dict(reservation)
+
+    def _reservation_is_overdue_pending(self, reservation):
+        """予約が「待機中」のまま、録音終了予定時刻を過ぎてしまっているか
+        （＝実行されるはずだったのに実行されなかった予約）を判定する
+        """
+        return reservation_logic.reservation_is_overdue_pending(
+            reservation, self.manager.is_recording_active
+        )
+
+    def _reservation_needs_timefree_recovery(self, reservation):
+        """この予約をタイムフリーで取り直す価値があるか（失敗・中断・実行し損ねて
+        終了時刻を過ぎた待機中、のいずれか。既にタイムフリーで取得済みなら対象外）"""
+        return reservation_logic.reservation_needs_timefree_recovery(
+            reservation, self.manager.is_recording_active
+        )
+
+    def _notify_missed_reservations_on_startup(self):
+        """起動時: 取り逃した予約（失敗・中断・実行され損ねた待機中）があれば通知する
+
+        予約録音タブの「タイムフリー」列からいつでも後追いでダウンロードできるが、
+        気づかず取りこぼしたままになるのを防ぐため、起動のたびに一度だけ知らせる。
+        """
+        missed = [
+            r for r in self.manager.load_reservations()
+            if self._reservation_needs_timefree_recovery(r)
+        ]
+        if not missed:
+            return
+        message = (
+            f"取り逃した予約が{len(missed)}件あります。\n"
+            "予約録音タブの「タイムフリー」列からダウンロードできます。"
+        )
+        if self._tray_icon is not None:
+            self._notify_via_tray("予約録音", message)
+        else:
+            messagebox.showinfo("予約録音", message)
+
+    def _on_reservation_tree_click(self, event):
+        """予約一覧のクリック処理: 「タイムフリー」列のクリックのみ、対象予約の
+        タイムフリー取得ダイアログを開く（それ以外は通常の行選択に任せる）
+        """
+        tree = self.reservation_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        columns = tree["columns"]
+        try:
+            col_index = int(tree.identify_column(event.x).replace("#", "")) - 1
+        except ValueError:
+            return
+        if not (0 <= col_index < len(columns)) or columns[col_index] != "download":
+            return
+        row_id = tree.identify_row(event.y)
+        if not row_id:
+            return
+        reservation = self.manager.get_reservation(self._reservation_row_map.get(row_id))
+        if not reservation or not self._reservation_needs_timefree_recovery(reservation):
+            return
+        self._download_reservation_via_timefree(reservation)
+
+    def _download_reservation_via_timefree(self, reservation):
+        """予約一覧の「タイムフリー」列から、指定予約の直近の回をタイムフリーで取得する
+
+        取得に成功したら、この予約を「DL済」としてマークし、一覧のボタンを消す。
+        """
+        program = self._reservation_occurrence_program_dict(reservation)
+        if program is None:
+            messagebox.showinfo("タイムフリー", "この予約の日時情報を取得できませんでした。")
+            return
+        reservation_id = reservation['id']
+        self._open_timefree_download_dialog(
+            program, station=reservation.get('station'),
+            on_success=lambda rid=reservation_id: self._mark_reservation_timefree_downloaded(rid)
+        )
+
+    def _mark_reservation_timefree_downloaded(self, reservation_id):
+        """予約をタイムフリーで取得し終えたことを記録し、一覧表示を更新する"""
+        self.manager.update_reservation(reservation_id, {'timefree_downloaded': True})
+        self._refresh_reservation_list()
 
     def _get_selected_reservations(self):
         """予約一覧で選択中の行に対応する予約データを全て取得する（未選択なら空リスト）"""
@@ -1450,6 +1722,84 @@ class RecRApp:
         for reservation in reservations:
             self.manager.update_reservation(reservation['id'], {'enabled': enabled})
         self._refresh_reservation_list()
+
+    def _delete_finished_reservations(self):
+        """「終了した予約を削除」ボタン: 放送が終わった単発予約をまとめて削除する
+
+        毎週予約は繰り返し使われ続けるため対象外。まだ一度も実行されていない
+        単発予約や、現在録音中のものも「終了」ではないため対象外とする。
+        """
+        finished = [
+            r for r in self.manager.load_reservations()
+            if r.get('repeat') != 'weekly' and r.get('last_run_date')
+            and not self.manager.is_recording_active(r.get('station'))
+        ]
+        if not finished:
+            messagebox.showinfo("予約の削除", "削除対象の終了した予約はありません。")
+            return
+
+        failed = [r for r in finished if r.get('last_result') == 'failed']
+        include_failed = self._confirm_delete_finished_reservations(len(finished), len(failed))
+        if include_failed is None:
+            return
+
+        targets = finished if include_failed else [r for r in finished if r not in failed]
+        if not targets:
+            return
+        for reservation in targets:
+            self.manager.delete_reservation(reservation['id'])
+        self._refresh_reservation_list()
+        messagebox.showinfo("予約の削除", f"終了した予約を{len(targets)}件削除しました。")
+
+    def _confirm_delete_finished_reservations(self, finished_count, failed_count):
+        """「終了した予約を削除」の確認ダイアログ。失敗した予約も含めて削除するかを
+        チェックボックスで選べる（応答するまで処理をブロックする）。
+
+        Returns:
+            bool または None: 削除を実行するなら True/False（失敗分を含めるか）、
+            キャンセルされた場合は None
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("終了した予約の削除")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame, text=f"終了した予約が{finished_count}件あります。まとめて削除しますか？"
+        ).pack(anchor=tk.W)
+
+        include_failed_var = tk.BooleanVar(value=False)
+        if failed_count:
+            ttk.Checkbutton(
+                frame, text=f"失敗した予約（{failed_count}件）も削除する",
+                variable=include_failed_var
+            ).pack(anchor=tk.W, pady=(8, 0))
+
+        result = {'value': None}
+
+        def on_delete():
+            result['value'] = include_failed_var.get()
+            dialog.destroy()
+
+        def on_cancel():
+            result['value'] = None
+            dialog.destroy()
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=(15, 0))
+        ttk.Button(button_frame, text="削除", command=on_delete).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="キャンセル", command=on_cancel).pack(side=tk.LEFT, padx=5)
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        self._center_dialog_over_parent(dialog)
+        dialog.deiconify()
+        dialog.wait_window()
+        return result['value']
 
     def setup_freeword_tab(self, parent):
         """「フリーワード」タブのUIをセットアップ（キーワードの一覧・追加・編集・削除）
@@ -1988,7 +2338,7 @@ class RecRApp:
         row = 0
 
         ttk.Label(frame, text="ステーション：").grid(row=row, column=0, sticky=tk.W, pady=4)
-        station_var = tk.StringVar(value=data.get('station', self.station_var.get()))
+        station_var = tk.StringVar(value=data.get('station', self.schedule_station_var.get()))
         ttk.Combobox(
             frame, textvariable=station_var, values=self.manager.get_stations(),
             state="readonly", width=20
@@ -2163,9 +2513,8 @@ class RecRApp:
         due = self.manager.get_due_reservations()
         started_any = False
 
-        for reservation, start_dt, end_dt in due:
+        for reservation, start_dt, end_dt, occurrence_iso in due:
             station = reservation.get('station')
-            occurrence_iso = start_dt.date().isoformat()
 
             if station not in self.manager.get_stations():
                 self.manager.mark_reservation_run(reservation['id'], occurrence_iso, result='failed')
@@ -2297,15 +2646,25 @@ class RecRApp:
             self._unregister_active_recording(station)
             self._refresh_reservation_list()
 
-    def on_station_changed(self, event=None):
-        """ステーション切り替え時: 番組表を切り替え先のステーションのものに更新"""
-        self.load_schedule_for_current_station()
+    def on_schedule_station_changed(self, event=None):
+        """番組表タブのステーション切り替え時: 番組表を切り替え先のステーションのものに更新"""
+        if self.schedule_mode_var.get() == 'timefree':
+            self.load_timefree_schedule_for_current_station()
+        else:
+            self.load_schedule_for_current_station()
+
+    def on_schedule_mode_changed(self):
+        """「番組表」/「過去7日間」の表示モード切り替え時"""
+        if self.schedule_mode_var.get() == 'timefree':
+            self.load_timefree_schedule_for_current_station()
+        else:
+            self.load_schedule_for_current_station()
 
     def load_schedule_for_current_station(self):
         """選択中のステーションの番組表を表示する。
         キャッシュがあればそれを表示、なければ取得を確認するダイアログを出す
         """
-        station = self.station_var.get()
+        station = self.schedule_station_var.get()
         cached = self.manager.load_cached_schedule(station)
         if cached:
             self.display_schedule(cached)
@@ -2324,6 +2683,34 @@ class RecRApp:
         else:
             # 前のステーションの番組表が残らないようクリア
             self.display_schedule([])
+
+    def load_timefree_schedule_for_current_station(self):
+        """選択中のステーションのタイムフリー対象期間（過去7日間）の番組表を表示する。
+        キャッシュがあればそれを表示、なければ取得を確認するダイアログを出す
+
+        通常の番組表キャッシュ（局名のみをキーにする）と衝突しないよう、
+        "{局名}::timefree" というキーで別名空間に保存・取得する。
+        """
+        station = self.schedule_station_var.get()
+        cache_key = f"{station}::timefree"
+        cached = self.manager.load_cached_schedule(cache_key)
+        if cached:
+            self.display_schedule(cached, mode='timefree')
+            return
+
+        if messagebox.askyesno(
+            "タイムフリー",
+            f"{station} の過去7日間の番組表のキャッシュがありません。今すぐ取得しますか？"
+        ):
+            self._set_app_busy(True)
+            try:
+                programs = self.manager.get_timefree_schedule(station)
+                self.manager.save_schedule_cache(cache_key, programs)
+            finally:
+                self._set_app_busy(False)
+            self.display_schedule(programs, mode='timefree')
+        else:
+            self.display_schedule([], mode='timefree')
 
     def fetch_and_cache_schedule(self, station):
         """番組表を取得してキャッシュに保存する
@@ -2351,7 +2738,8 @@ class RecRApp:
 
     def load_schedule(self):
         """「番組表を取得」ボタン: 選択中のステーションの番組表を取得してキャッシュ更新し表示"""
-        station = self.station_var.get()
+        station = self.schedule_station_var.get()
+        self.schedule_mode_var.set('upcoming')
         self._set_app_busy(True)
         try:
             programs, success = self.fetch_and_cache_schedule(station)
@@ -2451,6 +2839,7 @@ class RecRApp:
             except Exception as e:
                 failed_stations.append(f"{station}（{e}）")
 
+        self.manager.prune_stale_schedule_cache()
         self.manager.save_settings({'last_full_schedule_refresh_date': today_iso})
         logger.info(
             f"全局番組表自動更新が完了しました（成功{len(stations) - len(failed_stations)}局 / "
@@ -2465,10 +2854,11 @@ class RecRApp:
         if any_created:
             self._refresh_reservation_list()
 
-        station = self.station_var.get()
-        cached = self.manager.load_cached_schedule(station)
-        if cached:
-            self.display_schedule(cached)
+        station = self.schedule_station_var.get()
+        if self.schedule_mode_var.get() != 'timefree':
+            cached = self.manager.load_cached_schedule(station)
+            if cached:
+                self.display_schedule(cached)
 
         if failed_stations:
             logger.warning(f"[全局自動更新] 取得に失敗した局: {', '.join(failed_stations)}")
@@ -2552,8 +2942,14 @@ class RecRApp:
                 return match.group(0).rstrip('.,)、。」』')
         return None
 
-    def display_schedule(self, programs):
-        """番組表データを、縦軸=時刻のグリッド（ラテ欄風）で表示"""
+    def display_schedule(self, programs, mode='upcoming'):
+        """番組表データを、縦軸=時刻のグリッド（ラテ欄風）で表示
+
+        Args:
+            mode (str): 'upcoming'（通常の番組表、当日以降のみ表示）または
+                'timefree'（過去7日間モード、当日を含む過去分のみ表示し、
+                全番組を放送済みスタイルで表示、ダブルクリックでタイムフリー取得）
+        """
         self._current_programs = programs
         colors = self._get_schedule_colors()
         canvas = self.schedule_canvas
@@ -2562,13 +2958,21 @@ class RecRApp:
             widget.destroy()
         self._program_canvas_items = {}
 
-        # 当日より前の日は表示しない（キャッシュが古い場合に過去の日付が残るのを防ぐ）
-        # date_iso を持たない古いキャッシュデータはそのまま表示する
         today_iso = datetime.now().strftime("%Y-%m-%d")
-        programs = [
-            p for p in programs
-            if p.get('date_iso') is None or p['date_iso'] >= today_iso
-        ]
+        if mode == 'timefree':
+            # 過去7日間モード: 今日を含む過去7日分のみ表示する
+            cutoff_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            programs = [
+                p for p in programs
+                if p.get('date_iso') and cutoff_iso <= p['date_iso'] <= today_iso
+            ]
+        else:
+            # 当日より前の日は表示しない（キャッシュが古い場合に過去の日付が残るのを防ぐ）
+            # date_iso を持たない古いキャッシュデータはそのまま表示する
+            programs = [
+                p for p in programs
+                if p.get('date_iso') is None or p['date_iso'] >= today_iso
+            ]
 
         # 日付ごとにグループ化（取得順を維持）
         days = {}
@@ -2624,7 +3028,7 @@ class RecRApp:
                 x1 = col_left + 2
                 x2 = col_left + self.DAY_COLUMN_WIDTH - 2
 
-                is_past = is_today_col and end_minutes <= now_minutes
+                is_past = mode == 'timefree' or (is_today_col and end_minutes <= now_minutes)
                 fill_color = colors['past_fill'] if is_past else colors['future_fill']
                 outline_color = colors['past_outline'] if is_past else colors['future_outline']
 
@@ -2703,10 +3107,16 @@ class RecRApp:
                     canvas.tag_bind(
                         item, "<Leave>", lambda e: self._hide_tooltip(), add="+"
                     )
-                    canvas.tag_bind(
-                        item, "<Double-Button-1>",
-                        lambda e, p=program: self._open_reservation_dialog_from_program(p), add="+"
-                    )
+                    if mode == 'timefree':
+                        canvas.tag_bind(
+                            item, "<Double-Button-1>",
+                            lambda e, p=program: self._open_timefree_download_dialog(p), add="+"
+                        )
+                    else:
+                        canvas.tag_bind(
+                            item, "<Double-Button-1>",
+                            lambda e, p=program: self._open_reservation_dialog_from_program(p), add="+"
+                        )
 
         right_edge = self.TIME_LABEL_WIDTH + num_cols * self.DAY_COLUMN_WIDTH
         canvas.create_line(right_edge, 0, right_edge, grid_height, fill=colors['day_line'])
@@ -2771,7 +3181,7 @@ class RecRApp:
 
     def start_recording(self):
         """録音を開始（局が異なれば、予約録音や他の手動録音と同時に進行できる）"""
-        station = self.station_var.get()
+        station = self.recording_station_var.get()
         try:
             duration = int(self.duration_var.get())
         except ValueError:
@@ -2838,13 +3248,62 @@ class RecRApp:
             self._refresh_active_recordings_panel()
             self._update_tray_icon_state()
 
-    def _refresh_active_recordings_panel(self):
-        """右上の「現在録音中」パネルを、現在の_active_recordingsの内容で作り直す
+    def _register_active_download(self, key, station, ft, title):
+        """右上パネルに表示する「タイムフリー取得中」の情報を登録する"""
+        self._active_downloads[key] = {
+            'station': station, 'ft': ft, 'title': title, 'done': 0, 'total': None,
+            'start_dt': datetime.now(),
+        }
+        self._refresh_active_recordings_panel()
 
-        各行に停止ボタンを添え、手動録音・予約録音のどちらもここから途中停止できるようにする。
+    def _update_active_download_progress(self, key, done, total):
+        """タイムフリー取得の進捗更新（メインスレッドから呼ばれる）
+
+        パネル全体を再構築せず、該当行のラベルだけを直接書き換える
+        （セグメント数が多い番組では頻繁に呼ばれるため）。
+        """
+        entry = self._active_downloads.get(key)
+        if entry is None:
+            return
+        entry['done'] = done
+        entry['total'] = total
+        label = self._download_progress_labels.get(key)
+        if label is not None:
+            label.config(text=self._format_download_progress_text(entry))
+
+    def _unregister_active_download(self, key):
+        """タイムフリー取得の終了に伴い、右上パネルからその表示を取り除く"""
+        if self._active_downloads.pop(key, None) is not None:
+            self._download_progress_labels.pop(key, None)
+            self._refresh_active_recordings_panel()
+
+    def _format_download_progress_text(self, entry):
+        base = f"⬇ {entry['station']}「{entry['title']}」 タイムフリー取得中..."
+        done, total = entry['done'], entry['total']
+        if not total:
+            return base
+
+        percent = int(done * 100 / total)
+        remaining_text = ""
+        if done > 0:
+            elapsed = (datetime.now() - entry['start_dt']).total_seconds()
+            if elapsed > 0:
+                remaining_seconds = (total - done) * (elapsed / done)
+                remaining_text = f"（残り約{self._format_duration(remaining_seconds)}）"
+        return f"{base} {percent}%{remaining_text}"
+
+    def _format_duration(self, seconds):
+        """秒数を「1時間2分」「5分」「30秒」のような大まかな日本語表記にする"""
+        return reservation_logic.format_duration(seconds)
+
+    def _refresh_active_recordings_panel(self):
+        """右上の「現在録音中／タイムフリー取得中」パネルを、現在の状態から作り直す
+
+        録音の各行には停止ボタンを添え、手動録音・予約録音のどちらもここから途中停止できるようにする。
         """
         for widget in self.active_recordings_frame.winfo_children():
             widget.destroy()
+        self._download_progress_labels = {}
         for station in sorted(self._active_recordings):
             info = self._active_recordings[station]
             text = (
@@ -2860,6 +3319,36 @@ class RecRApp:
                 row, text="■", width=2,
                 command=lambda s=station: self._stop_recording_by_station(s)
             ).pack(side=tk.LEFT, padx=(4, 0))
+        for key in sorted(self._active_downloads):
+            entry = self._active_downloads[key]
+            row = ttk.Frame(self.active_recordings_frame)
+            row.pack(anchor=tk.E)
+            label = ttk.Label(
+                row, text=self._format_download_progress_text(entry),
+                foreground="#3a6ea5", font=("Yu Gothic UI", 9)
+            )
+            label.pack(side=tk.LEFT)
+            self._download_progress_labels[key] = label
+            ttk.Button(
+                row, text="■", width=2,
+                command=lambda k=key: self._stop_download_by_key(k)
+            ).pack(side=tk.LEFT, padx=(4, 0))
+
+    def _stop_download_by_key(self, key):
+        """指定のタイムフリー取得（「局名|ft」キー）を停止する
+
+        それまでにダウンロード済みの内容はファイルに残る。停止処理はネットワーク
+        スレッドの終了待ち（最大5秒）を伴うため、_set_app_busy でその間操作を止める。
+        """
+        entry = self._active_downloads.get(key)
+        if entry is None:
+            return
+        self._set_app_busy(True)
+        try:
+            self.manager.stop_download(entry['station'], entry['ft'])
+        finally:
+            self._set_app_busy(False)
+        self._unregister_active_download(key)
 
     def _stop_recording_by_station(self, station):
         """指定局の録音を停止する（手動録音・予約録音のどちらでも使える共通処理）
@@ -2908,7 +3397,7 @@ class RecRApp:
 
     def start_playback(self):
         """選択中の局のライブ配信を再生"""
-        station = self.station_var.get()
+        station = self.playback_station_var.get()
         self._set_app_busy(True)
         try:
             success = self.manager.play_live(station)
@@ -2919,6 +3408,7 @@ class RecRApp:
             self.status_var.set(f"{station} を再生中...")
             self.play_button.config(state=tk.DISABLED)
             self.play_stop_button.config(state=tk.NORMAL)
+            self.top_bar_station_combo.config(state=tk.DISABLED)
             self._schedule_eq_update()
         else:
             messagebox.showerror(
@@ -2933,6 +3423,7 @@ class RecRApp:
         self.status_var.set("準備完了")
         self.play_button.config(state=tk.NORMAL)
         self.play_stop_button.config(state=tk.DISABLED)
+        self.top_bar_station_combo.config(state="readonly")
         if self._eq_update_job:
             self.root.after_cancel(self._eq_update_job)
             self._eq_update_job = None

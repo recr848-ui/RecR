@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(./venv/Scripts/python.exe -c ' *)",
+      "Bash(pip show *)",
+      "Bash(./venv/Scripts/python.exe -c \"import pytest; print\\(pytest.__version__\\)\")",
+      "Bash(./venv/Scripts/python.exe -m pip install pytest==8.3.4)",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/ -v)",
+      "Bash(./venv/Scripts/python.exe -m pytest -q)",
+      "Bash(python -m py_compile src/main.py utils/radiko_manager.py utils/reservation_logic.py)",
+      "Bash(python -c \"import datetime; print\\(datetime.date\\(2026,9,10\\).strftime\\('%A'\\), datetime.date\\(2026,9,10\\).weekday\\(\\)\\); print\\(datetime.date\\(2026,9,7\\).strftime\\('%A'\\)\\)\")",
+      "Bash(python -c ' *)",
+      "WebFetch(domain:www.gigafree.net)"
+    ]
+  }
+}
