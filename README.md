@@ -109,7 +109,7 @@ PyInstaller (`RecR.spec`) を使って単体の Windows 実行ファイルを作
 pyinstaller RecR.spec
 ```
 
-生成された `dist/RecR/` フォルダ一式（`RecR.exe` を含む）を Python 環境なしで実行できます。フォルダごと配布してください。
+生成された `dist/RecR/` フォルダ一式（`RecR.exe` を含む）を Python 環境なしで実行できます。
 
 ## ライセンス
 
