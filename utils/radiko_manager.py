@@ -152,6 +152,12 @@ class RadikoManager:
         # タイムフリーの同時ダウンロード数の上限（GUI側の設定で1〜10に変更可能。
         # 既定値はここ）
         self.max_concurrent_timefree_downloads = 3
+        # タイムフリー1件あたりの並列分割数。1セッション（lsid）内では実時間ペース
+        # からは逃れられないが、別セッションで別のft/to（時間区間）を指定すれば
+        # 待ち時間なく即座にその地点から取得を開始できることを実機で確認済み。
+        # そのため取得区間をこの数だけ分割し、別セッションで並列取得することで
+        # 実質的にこの倍数分ダウンロードを高速化する
+        self.timefree_parallel_splits = 4
         # 予約録音の開始・終了時刻に前後に足す余白秒数（GUI側の設定で0/15/30/45/60から
         # 選択可能。番組表の時刻と実際の配信のわずかなズレで冒頭・末尾が欠けるのを防ぐ）
         self.recording_margin_seconds = 0
@@ -908,6 +914,92 @@ class RadikoManager:
             return None
         return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
+    def _split_time_range(self, ft_dt, to_dt, num_splits):
+        """[ft_dt, to_dt) を num_splits 個の連続する区間に均等分割する
+
+        Returns:
+            list[(datetime, datetime)]: 区間の (開始, 終了) のリスト（時系列順）
+        """
+        total_seconds = (to_dt - ft_dt).total_seconds()
+        step = total_seconds / num_splits
+        bounds = [ft_dt + timedelta(seconds=round(step * i)) for i in range(num_splits)]
+        bounds.append(to_dt)
+        return list(zip(bounds[:-1], bounds[1:]))
+
+    def _iter_timefree_segments_parallel(self, playlist_base_url, station_id, auth_token,
+                                          ft_dt, to_dt, stop_event, on_progress=None,
+                                          num_splits=4):
+        """タイムフリーの取得区間を num_splits 分割し、それぞれ別セッション（別lsid）で
+        並列に取得することで、実質的に num_splits 倍速でダウンロードするジェネレーター。
+
+        _iter_timefree_segments は1セッション内では実時間ペースからは逃れられない
+        （連続ポーリングしても待たない限り新規セグメントは増えない）が、別セッションで
+        別のft/toを指定すれば、待ち時間なくその地点から即座に取得を開始できることを
+        実機で確認済み。そのため区間ごとに独立したスレッド・セッションで並列取得し、
+        時系列順（区間0→1→2...）を保ったまま生のAACバイト列を生成し直す。
+
+        並列に取得したデータは一旦区間ごとのQueueに貯め、呼び出し側へは区間の順番通りに
+        取り出して渡すため、出力される音声の時系列は分割前と変わらない。
+        """
+        ranges = self._split_time_range(ft_dt, to_dt, num_splits)
+        result_queues = [queue.Queue() for _ in ranges]
+        progress_lock = threading.Lock()
+        sub_done = [0] * len(ranges)
+        sub_total = [0] * len(ranges)
+
+        def make_sub_progress(idx):
+            def sub_progress(done, total):
+                with progress_lock:
+                    sub_done[idx] = done
+                    sub_total[idx] = total
+                    if on_progress:
+                        on_progress(sum(sub_done), sum(sub_total))
+            return sub_progress
+
+        def worker(idx, sub_ft_dt, sub_to_dt):
+            lsid = uuid.uuid4().hex
+            ft_str = sub_ft_dt.strftime("%Y%m%d%H%M%S")
+            to_str = sub_to_dt.strftime("%Y%m%d%H%M%S")
+            playlist_url = (
+                f"{playlist_base_url}?station_id={station_id}&start_at={ft_str}&ft={ft_str}"
+                f"&end_at={to_str}&to={to_str}&l=15&lsid={lsid}&type=b"
+            )
+            headers = {"X-Radiko-AuthToken": auth_token}
+            try:
+                for chunk in self._iter_timefree_segments(
+                    playlist_url, headers, stop_event, sub_to_dt,
+                    on_progress=make_sub_progress(idx)
+                ):
+                    result_queues[idx].put(("data", chunk))
+            except Exception as e:
+                result_queues[idx].put(("error", e))
+            finally:
+                result_queues[idx].put(("done", None))
+
+        threads = [
+            threading.Thread(target=worker, args=(i, r[0], r[1]), daemon=True)
+            for i, r in enumerate(ranges)
+        ]
+        for t in threads:
+            t.start()
+
+        try:
+            for idx in range(len(ranges)):
+                while True:
+                    kind, payload = result_queues[idx].get()
+                    if kind == "data":
+                        yield payload
+                    elif kind == "error":
+                        raise payload
+                    else:
+                        break
+        finally:
+            # 呼び出し側が早期に打ち切った場合（例外・途中終了）でも、
+            # 残っている区間のスレッドを確実に止めてから返す
+            stop_event.set()
+            for t in threads:
+                t.join(timeout=5)
+
     def _iter_timefree_segments(self, playlist_url, headers, stop_event, to_dt, on_progress=None):
         """タイムフリープレイリストの全セグメント(生のAACバイト列)を順に生成するジェネレーター。
 
@@ -985,6 +1077,7 @@ class RadikoManager:
             reached_end = False
             for seq, seg_url, dt_str in new_entries:
                 seg_dt = self._parse_program_date_time(dt_str)
+                is_last_segment = False
                 if seg_dt is not None:
                     if first_segment_dt is None:
                         first_segment_dt = seg_dt
@@ -994,8 +1087,17 @@ class RadikoManager:
                         if on_progress:
                             on_progress(0, total_estimate)
                     if seg_dt >= to_dt:
+                        # セグメントは target_duration 間隔で並ぶため、ちょうど to_dt と
+                        # 一致するセグメントは基本的に存在しない。この判定だけに頼ると
+                        # 「新規セグメントが取得できない」スタール判定（10回試行後に諦める。
+                        # 約25秒の無駄待ちと警告ログ付き）に落ちてしまうため、直前の
+                        # セグメント側（下記）で先に終端を検知する
                         reached_end = True
                         break
+                    if seg_dt + timedelta(seconds=target_duration) >= to_dt:
+                        # このセグメントの再生範囲が to_dt に達する＝実質最後のセグメント。
+                        # 取得してから終了する
+                        is_last_segment = True
 
                 if stop_event.is_set():
                     return
@@ -1014,6 +1116,9 @@ class RadikoManager:
                 done += 1
                 if on_progress and total_estimate:
                     on_progress(min(done, total_estimate), total_estimate)
+                if is_last_segment:
+                    reached_end = True
+                    break
 
             if reached_end:
                 break
@@ -1426,17 +1531,21 @@ class RadikoManager:
         # l は medialist が1回のリクエストで返す秒数の上限らしいが、大きい値（例: 600）を
         # 送ると400 Bad Requestになることを実機で確認したため、動作確認済みの15固定とする。
         # type=c（チャンク取得）+ seek での高速化も試したが実機で400になったため type=b のまま。
+        #
+        # ただし別セッション（別lsid）であれば、任意のft地点から待ち時間なく即座に
+        # 取得を開始できることを実機で確認済みなので、区間をtimefree_parallel_splits個に
+        # 分割し並列取得することで高速化する（_iter_timefree_segments_parallel）。
+        ft_dt = datetime.strptime(ft, "%Y%m%d%H%M%S")
         to_dt = datetime.strptime(to, "%Y%m%d%H%M%S")
-        lsid = uuid.uuid4().hex
-        playlist_url = (
-            f"{playlist_base_url}?station_id={station_id}&start_at={ft}&ft={ft}"
-            f"&end_at={to}&to={to}&l=15&lsid={lsid}&type=b"
-        )
+        # 極端に短い区間（分割後が30秒未満になる）では分割の意味が薄いため縮退させる
+        num_splits = max(1, min(
+            self.timefree_parallel_splits,
+            int((to_dt - ft_dt).total_seconds() // 30) or 1
+        ))
 
         # ファイル名の日時には、ダウンロードした時刻ではなく放送開始時刻(ft)を使う
         # （タイムフリーは後から取得するものなので、いつ聴いたかではなく、いつ放送された
         # 番組かがファイル名から分かるようにする）
-        ft_dt = datetime.strptime(ft, "%Y%m%d%H%M%S")
         ext = {"aac": "aac", "m4a": "m4a"}.get(file_format, "mp3")
         filename = self._build_recording_filename(
             filename_pattern or self.DEFAULT_FILENAME_PATTERN, station, title, ft_dt, ext
@@ -1444,9 +1553,9 @@ class RadikoManager:
         output_path = self._unique_output_path(self.output_dir / filename)
 
         stop_event = threading.Event()
-        headers = {"X-Radiko-AuthToken": auth_token}
-        segment_iter = self._iter_timefree_segments(
-            playlist_url, headers, stop_event, to_dt, on_progress=on_progress
+        segment_iter = self._iter_timefree_segments_parallel(
+            playlist_base_url, station_id, auth_token, ft_dt, to_dt, stop_event,
+            on_progress=on_progress, num_splits=num_splits
         )
         registry_key = f"{station}|{ft}"
         thread = threading.Thread(

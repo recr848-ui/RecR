@@ -27,6 +27,7 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 
 from PIL import Image, ImageDraw, ImageTk
 import pystray
+import requests
 import sv_ttk
 
 # 概要・詳細情報に含まれるURLを検出する正規表現
@@ -63,6 +64,10 @@ class RecRApp:
 
     # 検索結果クリック時のハイライト表示時間
     HIGHLIGHT_DURATION_MS = 8000
+
+    # 「録音」タブ右側のお知らせ欄に表示するMarkdownファイルの取得元。
+    # NOTICE.mdをmasterブランチにpushすると、次回起動時（または「更新」ボタン）で反映される
+    NOTICE_URL = "https://raw.githubusercontent.com/recr848-ui/RecR/master/NOTICE.md"
 
     def __init__(self, root):
         self.root = root
@@ -116,6 +121,7 @@ class RecRApp:
         self._busy_saved_states = {}
         self._reservation_check_job = None
         self._reservation_list_refresh_job = None
+        self._program_guide_refresh_job = None
         self._full_refresh_check_job = None
         self._full_refresh_in_progress = False
         # 局名 -> {'title', 'start_dt', 'end_dt'}。手動・予約を問わず、現在進行中の
@@ -135,8 +141,10 @@ class RecRApp:
         self.load_schedule_for_current_station()
         self._schedule_reservation_check()
         self._schedule_reservation_list_minute_refresh()
+        self._schedule_program_guide_minute_refresh()
         self._check_full_schedule_refresh_due()
         self.root.after(1500, self._notify_missed_reservations_on_startup)
+        self._refresh_notice()
 
     def on_close_button(self):
         """ウィンドウの×ボタン: アプリを終了せず、タスクトレイへ最小化する"""
@@ -258,6 +266,9 @@ class RecRApp:
         if self._reservation_list_refresh_job:
             self.root.after_cancel(self._reservation_list_refresh_job)
             self._reservation_list_refresh_job = None
+        if self._program_guide_refresh_job:
+            self.root.after_cancel(self._program_guide_refresh_job)
+            self._program_guide_refresh_job = None
         if self._full_refresh_check_job:
             self.root.after_cancel(self._full_refresh_check_job)
             self._full_refresh_check_job = None
@@ -626,12 +637,22 @@ class RecRApp:
 
         self.root.config(menu=menubar)
 
+        # tk.Menuはttkテーマの管理外のため、テーマ切り替え時に自前で配色し直せるよう
+        # 全メニューを保持しておく（_apply_menu_theme参照）
+        self._menus = [
+            menubar, file_menu, view_menu, eq_mode_menu, schedule_menu,
+            settings_menu, quality_menu, filename_menu, default_station_menu, margin_menu,
+        ]
+        self._apply_menu_theme()
+
     def _on_theme_changed(self):
         """テーマ（ライト/ダーク）切り替え時: sv_ttkのテーマを反映し、Canvas系の配色も更新する"""
         theme = self.theme_var.get()
         sv_ttk.set_theme(theme)
         self.manager.save_settings({'theme': theme})
         self._apply_canvas_theme()
+        self._apply_menu_theme()
+        self._apply_notice_theme()
         self.display_schedule(self._current_programs, mode=self.schedule_mode_var.get())
 
     def _apply_canvas_theme(self):
@@ -639,6 +660,32 @@ class RecRApp:
         colors = self._get_schedule_colors()
         self.schedule_canvas.configure(background=colors['bg'])
         self.day_header_frame.configure(background=colors['bg'])
+
+    def _get_menu_colors(self):
+        """現在のテーマ（ライト/ダーク）に応じたメニューの配色を返す
+
+        tk.Menu（ネイティブメニュー）はttkテーマの管理外なので、テーマ切り替え時に
+        自前で配色し直す必要がある。特に selectcolor はチェックボタン/ラジオボタン
+        項目のチェックマーク・丸印そのものの色で、ここを明示しないとダークテーマ時に
+        既定色のままでチェックが見えにくくなる（背景と同化する）ため必ず指定する。
+        """
+        if self.theme_var.get() == "dark":
+            return {
+                'bg': '#2b2b2b', 'fg': '#eaeaea',
+                'activebackground': '#3d3d3d', 'activeforeground': '#ffffff',
+                'selectcolor': '#78b3ff',
+            }
+        return {
+            'bg': '#ffffff', 'fg': '#1e1e1e',
+            'activebackground': '#e5e5e5', 'activeforeground': '#000000',
+            'selectcolor': '#1a5fb4',
+        }
+
+    def _apply_menu_theme(self):
+        """setup_top_barで作成した全てのtk.Menuに、現在のテーマの配色を反映し直す"""
+        colors = self._get_menu_colors()
+        for menu in getattr(self, '_menus', []):
+            menu.configure(**colors)
 
     def _get_schedule_colors(self):
         """現在のテーマ（ライト/ダーク）に応じた番組表グリッドの配色を返す"""
@@ -842,10 +889,22 @@ class RecRApp:
             messagebox.showinfo("番組表の一括更新", "すべてのステーションの番組表を更新しました。")
 
     def setup_record_tab(self, parent):
-        """「録音」タブのUIをセットアップ"""
+        """「録音」タブのUIをセットアップ
+
+        左側にステーション選択・録音設定を、右側にお知らせ欄を配置する2カラム構成。
+        左側はfill=tk.Yのみ（横方向には広がらない）にすることで、ウィンドウ幅
+        （番組表グリッド表示のため1450px確保）いっぱいまでコンボボックス等が
+        間延びしてしまうのを防ぐ。
+        """
+        content_frame = ttk.Frame(parent)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        left_frame = ttk.Frame(content_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+
         # タイトル
         title_label = ttk.Label(
-            parent,
+            left_frame,
             text="RecR - ラジコ録音アプリ",
             font=("Yu Gothic UI", 16, "bold")
         )
@@ -853,14 +912,14 @@ class RecRApp:
 
         # 説明
         instructions = ttk.Label(
-            parent,
+            left_frame,
             text="ステーションを選択して録音設定をしてください",
             font=("Yu Gothic UI", 10)
         )
         instructions.pack(pady=5)
 
         # ステーション選択フレーム
-        station_frame = ttk.LabelFrame(parent, text="ステーション選択", padding=10)
+        station_frame = ttk.LabelFrame(left_frame, text="ステーション選択", padding=10)
         station_frame.pack(fill=tk.BOTH, padx=10, pady=10)
 
         ttk.Label(station_frame, text="ステーション：").grid(row=0, column=0, sticky=tk.W)
@@ -874,9 +933,9 @@ class RecRApp:
         station_frame.columnconfigure(1, weight=1)
 
         # 録音時間フレーム
-        duration_frame = ttk.LabelFrame(parent, text="録音設定", padding=10)
+        duration_frame = ttk.LabelFrame(left_frame, text="録音設定", padding=10)
         duration_frame.pack(fill=tk.BOTH, padx=10, pady=10)
-        
+
         ttk.Label(duration_frame, text="録音時間 (分):").grid(row=0, column=0, sticky=tk.W)
         self.duration_var = tk.StringVar(value="60")
         duration_spin = ttk.Spinbox(
@@ -915,7 +974,7 @@ class RecRApp:
         self._set_bitrate_widgets_visible(self.format_var.get() == "mp3")
 
         # ボタンフレーム
-        button_frame = ttk.Frame(parent)
+        button_frame = ttk.Frame(left_frame)
         button_frame.pack(pady=20)
 
         start_button = ttk.Button(
@@ -938,7 +997,7 @@ class RecRApp:
         # 録音中インジケーター（点滅する「● REC」表示）
         self.rec_indicator_var = tk.StringVar(value="")
         self.rec_indicator_label = ttk.Label(
-            parent, textvariable=self.rec_indicator_var,
+            left_frame, textvariable=self.rec_indicator_var,
             foreground="red", font=("Yu Gothic UI", 12, "bold")
         )
         self.rec_indicator_label.pack(pady=(0, 10))
@@ -951,8 +1010,86 @@ class RecRApp:
 
         # ステータスラベル
         self.status_var = tk.StringVar(value="準備完了")
-        status_label = ttk.Label(parent, textvariable=self.status_var)
+        status_label = ttk.Label(left_frame, textvariable=self.status_var)
         status_label.pack(pady=10)
+
+        self._setup_notice_panel(content_frame)
+
+    def _setup_notice_panel(self, parent):
+        """「録音」タブ右側のお知らせ欄をセットアップ
+
+        GitHub上のNOTICE.md（NOTICE_URL）を取得し、テキストとしてそのまま表示する。
+        本物のHTML/Markdownレンダリングは行わない（tk.Textによるプレーンテキスト表示）。
+        """
+        notice_frame = ttk.LabelFrame(parent, text="お知らせ", padding=10)
+        notice_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 10), pady=10)
+
+        header = ttk.Frame(notice_frame)
+        header.pack(fill=tk.X)
+        self.notice_status_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.notice_status_var, font=("Yu Gothic UI", 8)).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(header, text="更新", width=6, command=self._refresh_notice).pack(side=tk.RIGHT)
+
+        text_container = ttk.Frame(notice_frame)
+        text_container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        scrollbar = ttk.Scrollbar(text_container, orient=tk.VERTICAL)
+        self.notice_text = tk.Text(
+            text_container, wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
+            padx=8, pady=8, font=("Yu Gothic UI", 10),
+            yscrollcommand=scrollbar.set, borderwidth=0, highlightthickness=0
+        )
+        scrollbar.config(command=self.notice_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.notice_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._apply_notice_theme()
+        self._set_notice_text("読み込み中…")
+
+    def _get_notice_colors(self):
+        """現在のテーマ（ライト/ダーク）に応じたお知らせ欄（tk.Text）の配色を返す
+
+        tk.Textもtk.Menu/tk.Canvasと同様にttkテーマの管理外のため、テーマ切り替え時に
+        自前で配色し直す必要がある
+        """
+        schedule_colors = self._get_schedule_colors()
+        return {'bg': schedule_colors['bg'], 'fg': schedule_colors['title']}
+
+    def _apply_notice_theme(self):
+        """お知らせ欄（tk.Text）に、現在のテーマの配色を反映し直す"""
+        if hasattr(self, 'notice_text'):
+            self.notice_text.configure(**self._get_notice_colors())
+
+    def _refresh_notice(self):
+        """お知らせ欄の内容をGitHubから取得し直す（バックグラウンドスレッドで実行）"""
+        self.notice_status_var.set("取得中…")
+        thread = threading.Thread(target=self._fetch_notice_worker, daemon=True)
+        thread.start()
+
+    def _fetch_notice_worker(self):
+        """バックグラウンドスレッド本体: NOTICE_URLからテキストを取得する。
+        Tkinterウィジェットには一切触れず、完了後の反映はroot.after経由で行う。
+        """
+        try:
+            res = requests.get(self.NOTICE_URL, timeout=8)
+            res.raise_for_status()
+            text = res.text.strip() or "（お知らせはありません）"
+            status = ""
+        except Exception as e:
+            logger.warning(f"お知らせの取得に失敗しました: {e}")
+            text = "お知らせを取得できませんでした。\nネットワーク接続を確認して「更新」を押してください。"
+            status = "取得失敗"
+        self.root.after(0, self._set_notice_text, text, status)
+
+    def _set_notice_text(self, text, status=""):
+        """お知らせ欄のテキストを差し替える（メインスレッド専用）"""
+        self.notice_text.configure(state=tk.NORMAL)
+        self.notice_text.delete("1.0", tk.END)
+        self.notice_text.insert("1.0", text)
+        self.notice_text.configure(state=tk.DISABLED)
+        self.notice_status_var.set(status)
 
     def _on_format_changed(self, event=None):
         """ファイル形式コンボボックス変更時: MP3のときだけビットレート選択を表示し、設定を保存する"""
@@ -1728,17 +1865,28 @@ class RecRApp:
 
         毎週予約は繰り返し使われ続けるため対象外。まだ一度も実行されていない
         単発予約や、現在録音中のものも「終了」ではないため対象外とする。
+
+        タイムフリーで取得済み（一覧で「DL済」表示）の予約は、録音自体は
+        失敗していて last_result が 'failed'/'partial' のままでも実質的には
+        解決済みのため、「失敗」側には含めず、確認なしで通常の削除対象に含める。
+        録音が一度も実行されないまま（last_run_date が未設定のまま）タイムフリーで
+        直接取得したケースもあるため、その場合も timefree_downloaded だけで「終了」と
+        みなす（last_run_date の有無は問わない）。
         """
         finished = [
             r for r in self.manager.load_reservations()
-            if r.get('repeat') != 'weekly' and r.get('last_run_date')
+            if r.get('repeat') != 'weekly'
+            and (r.get('last_run_date') or r.get('timefree_downloaded'))
             and not self.manager.is_recording_active(r.get('station'))
         ]
         if not finished:
             messagebox.showinfo("予約の削除", "削除対象の終了した予約はありません。")
             return
 
-        failed = [r for r in finished if r.get('last_result') == 'failed']
+        failed = [
+            r for r in finished
+            if r.get('last_result') == 'failed' and not r.get('timefree_downloaded')
+        ]
         include_failed = self._confirm_delete_finished_reservations(len(finished), len(failed))
         if include_failed is None:
             return
@@ -2463,9 +2611,17 @@ class RecRApp:
         dialog.focus_force()
 
     def _schedule_reservation_check(self):
-        """予約録音の開始時刻が来ていないか一定間隔でチェックする"""
-        self._check_due_reservations()
-        self._update_sleep_prevention()
+        """予約録音の開始時刻が来ていないか一定間隔でチェックする
+
+        処理中に予期せぬ例外が発生しても、再スケジュールだけは必ず行う。
+        そうしないと、長時間起動しっぱなしの環境でこのループが静かに
+        止まってしまい、以降の予約録音が一切行われなくなる
+        """
+        try:
+            self._check_due_reservations()
+            self._update_sleep_prevention()
+        except Exception:
+            logger.exception("予約チェック処理でエラーが発生しました")
         self._reservation_check_job = self.root.after(15000, self._schedule_reservation_check)
 
     def _on_prevent_sleep_changed(self):
@@ -2495,12 +2651,35 @@ class RecRApp:
             logger.warning(f"スリープ抑止状態の変更に失敗しました: {e}")
 
     def _schedule_reservation_list_minute_refresh(self):
-        """予約一覧の状態（成功/失敗/録音中）は時間経過で変わるため、毎分0秒に再描画する"""
-        self._refresh_reservation_list()
+        """予約一覧の状態（成功/失敗/録音中）は時間経過で変わるため、毎分0秒に再描画する
+
+        再描画中に例外が起きても再スケジュールだけは必ず行い、長時間起動時に
+        このループ自体が止まってしまわないようにする
+        """
+        try:
+            self._refresh_reservation_list()
+        except Exception:
+            logger.exception("予約一覧の再描画でエラーが発生しました")
         now = datetime.now()
         seconds_until_next_minute = 60 - now.second - now.microsecond / 1_000_000
         self._reservation_list_refresh_job = self.root.after(
             int(seconds_until_next_minute * 1000), self._schedule_reservation_list_minute_refresh
+        )
+
+    def _schedule_program_guide_minute_refresh(self):
+        """番組表の「終了済み番組のグレーアウト」は時間経過で変わるため、毎分0秒に再描画する
+
+        再描画中に例外が起きても再スケジュールだけは必ず行い、長時間起動時に
+        このループ自体が止まってしまわないようにする
+        """
+        try:
+            self.display_schedule(self._current_programs, mode=self.schedule_mode_var.get())
+        except Exception:
+            logger.exception("番組表の再描画でエラーが発生しました")
+        now = datetime.now()
+        seconds_until_next_minute = 60 - now.second - now.microsecond / 1_000_000
+        self._program_guide_refresh_job = self.root.after(
+            int(seconds_until_next_minute * 1000), self._schedule_program_guide_minute_refresh
         )
 
     def _check_due_reservations(self):
@@ -2689,7 +2868,8 @@ class RecRApp:
         キャッシュがあればそれを表示、なければ取得を確認するダイアログを出す
 
         通常の番組表キャッシュ（局名のみをキーにする）と衝突しないよう、
-        "{局名}::timefree" というキーで別名空間に保存・取得する。
+        "{局名}::timefree" というキーで別名空間に保存・取得
+        する。
         """
         station = self.schedule_station_var.get()
         cache_key = f"{station}::timefree"
@@ -2999,6 +3179,21 @@ class RecRApp:
         spacer = tk.Frame(self.day_header_frame, width=self.TIME_LABEL_WIDTH)
         spacer.pack(side=tk.LEFT, fill=tk.Y)
         spacer.pack_propagate(False)
+
+        if not programs:
+            # 番組が1件もない状態（未取得・取得を見送った・キャッシュが空、など）を
+            # 目盛りだけの空グリッドのまま放置すると、壊れているように見えてしまうため
+            # 案内メッセージを出す。スクロールしなくても必ず見える位置（先頭付近）に置く
+            message = (
+                "この局のタイムフリー番組表がありません。\n局を選び直すか表示モードを切り替えると取得を確認します"
+                if mode == 'timefree' else
+                "番組表がありません。「番組表を一括更新」または局を選び直すと取得を確認します"
+            )
+            canvas.create_text(
+                self.TIME_LABEL_WIDTH + 20, 80,
+                text=message, anchor=tk.NW, justify=tk.LEFT,
+                font=("Yu Gothic UI", 10), fill=colors['desc']
+            )
 
         now = datetime.now()
         now_minutes = self._minutes_from_day_start(now.strftime("%H:%M"))
