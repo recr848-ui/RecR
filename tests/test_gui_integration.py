@@ -16,6 +16,7 @@ Tkの実ウィンドウはテストごとに作り直すとTcl側の状態がま
 ウィジェットだけ後始末する）。
 """
 import tkinter as tk
+from datetime import datetime, timedelta
 from tkinter import messagebox
 
 import pytest
@@ -49,6 +50,7 @@ def app(monkeypatch, tmp_path, shared_root):
     monkeypatch.setattr(
         RadikoManager, "get_sample_schedule", lambda self, station, days=10: []
     )
+    monkeypatch.setattr(RadikoManager, "get_timefree_schedule", lambda self, station: [])
     # messagebox系は全部モックする。showwarning等を1つでも生で残すと、
     # 起動時の _refresh_stale_stations 等から本物のポップアップダイアログが
     # 実際の画面上に表示されてしまう（実際に一度これで表示させてしまった）
@@ -346,3 +348,208 @@ def test_notice_text_colors_track_theme(app):
     dark_bg = str(app.notice_text.cget("bg"))
 
     assert light_bg != dark_bg
+
+
+def test_schedule_font_size_levels_scale_fonts_and_grid_height(app):
+    """番組表の文字サイズ設定（小/中/大）で、文字サイズが2ptずつ増え、
+    グリッドの縦方向の拡大率（PIXELS_PER_MINUTE、ひいてはグリッドの高さ）も
+    タイトルの文字サイズに比例して大きくなること
+    """
+    app.display_schedule([], mode='upcoming')  # _schedule_grid_heightを確定させる
+
+    expected = {
+        'small': {'title': 8, 'desc': 7, 'hour_label': 8, 'date_header': 9, 'ppm': 2.0},
+        'medium': {'title': 10, 'desc': 9, 'hour_label': 10, 'date_header': 11, 'ppm': 2.5},
+        'large': {'title': 12, 'desc': 11, 'hour_label': 12, 'date_header': 13, 'ppm': 3.0},
+    }
+
+    grid_heights = {}
+    for level, exp in expected.items():
+        app.schedule_font_size_var.set(level)
+        app._on_schedule_font_size_changed()
+
+        assert app.schedule_title_font.cget('size') == exp['title']
+        assert app.schedule_title_link_font.cget('size') == exp['title']
+        assert app.schedule_desc_font.cget('size') == exp['desc']
+        assert app._schedule_hour_label_size == exp['hour_label']
+        assert app._schedule_date_header_size == exp['date_header']
+        assert app.PIXELS_PER_MINUTE == pytest.approx(exp['ppm'])
+        grid_heights[level] = app._schedule_grid_height
+
+    assert grid_heights['small'] < grid_heights['medium'] < grid_heights['large']
+
+
+def test_timefree_schedule_refetches_when_cache_is_entirely_out_of_window(app, monkeypatch):
+    """タイムフリーのキャッシュが7日以上前に取得したままで、対象期間（当日を含む
+    過去7日間）を丸ごと過ぎ去っている場合、キャッシュがあっても空グリッドで
+    済ませず再取得を促すこと。
+
+    実際にNHK FMでこれが発生していた（9日前に取得したキャッシュが残っていて、
+    display_scheduleの日付フィルタで全件除外され、空の番組表になっていた）
+    """
+    station = "TBSラジオ"
+    stale_programs = [{
+        'date': '9/3(木)', 'date_iso': '2026-09-03', 'start': '05:00', 'end': '06:00',
+        'title': '9日以上前の古いキャッシュ番組',
+    }]
+    app.manager.save_schedule_cache(f"{station}::timefree", stale_programs)
+
+    fresh_programs = [{
+        'date': '9/18(金)', 'date_iso': '2026-09-18', 'start': '05:00', 'end': '06:00',
+        'title': '再取得された新しい番組',
+    }]
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda st: fresh_programs)
+
+    asked = {}
+    def fake_askyesno(*a, **k):
+        asked['called'] = True
+        return True
+    monkeypatch.setattr(messagebox, "askyesno", fake_askyesno)
+
+    app.schedule_station_var.set(station)
+    app.load_timefree_schedule_for_current_station()
+
+    assert asked.get('called'), "古いキャッシュのまま再取得を促さなかった"
+    assert app._current_programs == fresh_programs
+
+
+def test_timefree_schedule_uses_cache_when_still_within_window(app, monkeypatch):
+    """タイムフリーのキャッシュに対象期間内のデータが残っていれば、
+    再取得を促さずそのキャッシュをそのまま使うこと（正常系の回帰防止）
+    """
+    station = "TBSラジオ"
+    fresh_cached = [{
+        'date': '9/17(木)', 'date_iso': '2026-09-17', 'start': '05:00', 'end': '06:00',
+        'title': '期間内のキャッシュ番組',
+    }]
+    app.manager.save_schedule_cache(f"{station}::timefree", fresh_cached)
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("キャッシュが有効なのに再取得の確認ダイアログを出した")
+    monkeypatch.setattr(messagebox, "askyesno", fail_if_called)
+
+    app.schedule_station_var.set(station)
+    app.load_timefree_schedule_for_current_station()
+
+    assert app._current_programs == fresh_cached
+
+
+def test_schedule_font_size_setting_persists(app):
+    """番組表の文字サイズ設定は、次回起動時に反映されるよう保存されること"""
+    app.schedule_font_size_var.set('large')
+    app._on_schedule_font_size_changed()
+    assert app.manager.load_settings().get('schedule_font_size') == 'large'
+
+
+def test_full_schedule_refresh_also_refreshes_timefree_cache(app, monkeypatch):
+    """毎日の全局自動更新（_full_schedule_refresh_worker）で、通常の番組表だけで
+    なくタイムフリー（過去7日間）のキャッシュも一緒に更新されること。
+
+    以前はこの自動更新がタイムフリー側のキャッシュに一切触れておらず、該当局の
+    タイムフリータブを開かない限り何日経っても更新されなかった（対象期間を
+    丸ごと過ぎ去ってから開くと空の番組表になる不具合があった）
+    """
+    # prune_stale_schedule_cacheが実行されるため、テスト環境のフォールバック局
+    # 一覧（_DEFAULT_STATION_MAPPING）に実在する局名を使う必要がある
+    station = next(iter(app.manager.station_mapping))
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+
+    upcoming_programs = [{
+        'date': '1/1(木)', 'date_iso': '2099-01-01', 'start': '09:00', 'end': '10:00',
+        'title': '未来の番組',
+    }]
+    timefree_programs = [{
+        'date': '今日', 'date_iso': today_iso, 'start': '05:00', 'end': '06:00',
+        'title': '過去の番組',
+    }]
+    monkeypatch.setattr(
+        app.manager, "get_program_schedule", lambda station, days=10: upcoming_programs
+    )
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda station: timefree_programs)
+    monkeypatch.setattr(app.manager, "scan_freewords_for_station", lambda station, programs: [])
+
+    app._full_schedule_refresh_worker([station], today_iso)
+    for _ in range(10):
+        app.root.update()
+
+    assert app.manager.load_cached_schedule(station) == upcoming_programs
+    assert app.manager.load_cached_schedule(f"{station}::timefree") == timefree_programs
+
+
+def test_fetch_and_cache_schedule_also_refreshes_timefree_cache(app, monkeypatch):
+    """fetch_and_cache_schedule（「番組表を取得」ボタン・起動時の自動更新・
+    「番組表を一括更新」が共通で通る経路）を呼ぶと、通常の番組表と同じ
+    タイミングでタイムフリー（過去7日間）のキャッシュも一緒に更新されること
+    """
+    station = next(iter(app.manager.station_mapping))
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+
+    upcoming_programs = [{
+        'date': '1/1(木)', 'date_iso': '2099-01-01', 'start': '09:00', 'end': '10:00',
+        'title': '未来の番組',
+    }]
+    timefree_programs = [{
+        'date': '今日', 'date_iso': today_iso, 'start': '05:00', 'end': '06:00',
+        'title': '過去の番組',
+    }]
+    monkeypatch.setattr(
+        app.manager, "get_program_schedule", lambda station, days=10: upcoming_programs
+    )
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda station: timefree_programs)
+
+    app.fetch_and_cache_schedule(station)
+
+    assert app.manager.load_cached_schedule(f"{station}::timefree") == timefree_programs
+
+
+def test_fetch_and_cache_schedule_ignores_timefree_fetch_failure(app, monkeypatch):
+    """タイムフリー側の取得が例外を投げても、通常の番組表取得自体は失敗にしない
+    （ベストエフォート）こと
+    """
+    station = next(iter(app.manager.station_mapping))
+    upcoming_programs = [{
+        'date': '1/1(木)', 'date_iso': '2099-01-01', 'start': '09:00', 'end': '10:00',
+        'title': '未来の番組',
+    }]
+    monkeypatch.setattr(
+        app.manager, "get_program_schedule", lambda station, days=10: upcoming_programs
+    )
+
+    def raise_err(station):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", raise_err)
+
+    programs, success = app.fetch_and_cache_schedule(station)
+
+    assert success is True
+    assert programs == upcoming_programs
+
+
+def test_timefree_columns_ordered_oldest_to_newest_left_to_right(app):
+    """タイムフリー番組表の列は、通常の番組表と同じく左が過去・右が現在になる
+    よう並ぶこと（get_timefree_scheduleの取得順は「今日→過去」なので、
+    表示側で並べ替えないと逆順になってしまっていた）
+    """
+    now = datetime.now()
+    programs = []
+    # 取得順をそのまま模した並び: 今日(offset0)→過去(offset1..3)
+    for offset in range(4):
+        d = now - timedelta(days=offset)
+        programs.append({
+            'date': f'{d.month}/{d.day}', 'date_iso': d.strftime('%Y-%m-%d'),
+            'start': '05:00', 'end': '06:00', 'title': f'offset{offset}',
+        })
+
+    app.display_schedule(programs, mode='timefree')
+
+    labels = [
+        w.cget('text')
+        for cell in app.day_header_frame.winfo_children()
+        for w in cell.winfo_children()
+        if w.winfo_class() == 'TLabel'
+    ]
+    expected = [
+        f"{(now - timedelta(days=offset)).month}/{(now - timedelta(days=offset)).day}"
+        for offset in range(3, -1, -1)
+    ]
+    assert labels == expected

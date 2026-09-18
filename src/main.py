@@ -51,6 +51,16 @@ class RecRApp:
     TIME_LABEL_WIDTH = 55
     DAY_HEADER_HEIGHT = 28
 
+    # 番組表の文字サイズ設定（小/中/大）。「小」を基準に、文字サイズ設定に応じて
+    # 2ポイントずつ引き上げる。縦方向の1分あたりピクセル数（PIXELS_PER_MINUTE）も
+    # タイトルの文字サイズに比例して拡大し、大きい文字でも番組枠に収まりやすくする
+    SCHEDULE_FONT_SIZE_DELTA = {'small': 0, 'medium': 2, 'large': 4}
+    SCHEDULE_BASE_TITLE_SIZE = 8
+    SCHEDULE_BASE_DESC_SIZE = 7
+    SCHEDULE_BASE_HOUR_LABEL_SIZE = 8
+    SCHEDULE_BASE_DATE_HEADER_SIZE = 9
+    SCHEDULE_BASE_PIXELS_PER_MINUTE = 2.0
+
     # 番組表の取得日数、および自動更新のしきい値
     SCHEDULE_FETCH_DAYS = 10
     SCHEDULE_STALE_THRESHOLD_DAYS = 4
@@ -102,6 +112,9 @@ class RecRApp:
         self.recording_station_var = tk.StringVar(value=default_station)
         self.schedule_station_var = tk.StringVar(value=default_station)
         self.schedule_mode_var = tk.StringVar(value='upcoming')
+        self.schedule_font_size_var = tk.StringVar(
+            value=settings.get('schedule_font_size', 'small')
+        )
 
         self.SCHEDULE_FETCH_DAYS = settings.get('schedule_fetch_days', self.SCHEDULE_FETCH_DAYS)
         self.SCHEDULE_STALE_THRESHOLD_DAYS = settings.get(
@@ -687,6 +700,32 @@ class RecRApp:
         for menu in getattr(self, '_menus', []):
             menu.configure(**colors)
 
+    def _apply_schedule_font_size(self):
+        """番組表の文字サイズ設定（小/中/大）を、フォントオブジェクトと
+        グリッドの縦方向の拡大率（PIXELS_PER_MINUTE）に反映する。
+
+        再描画は行わないので、呼び出し側で必要に応じてdisplay_scheduleを呼ぶこと。
+        タイトル・概要・時刻目盛・日付ヘッダーの文字サイズは「小」を基準に同じ
+        ポイント数だけ引き上げ、縦の拡大率はタイトルの文字サイズに比例させることで、
+        文字を大きくしても番組枠からはみ出しにくくしている。
+        """
+        delta = self.SCHEDULE_FONT_SIZE_DELTA.get(self.schedule_font_size_var.get(), 0)
+        title_size = self.SCHEDULE_BASE_TITLE_SIZE + delta
+        self.schedule_title_font.configure(size=title_size)
+        self.schedule_title_link_font.configure(size=title_size)
+        self.schedule_desc_font.configure(size=self.SCHEDULE_BASE_DESC_SIZE + delta)
+        self._schedule_hour_label_size = self.SCHEDULE_BASE_HOUR_LABEL_SIZE + delta
+        self._schedule_date_header_size = self.SCHEDULE_BASE_DATE_HEADER_SIZE + delta
+        self.PIXELS_PER_MINUTE = (
+            self.SCHEDULE_BASE_PIXELS_PER_MINUTE * title_size / self.SCHEDULE_BASE_TITLE_SIZE
+        )
+
+    def _on_schedule_font_size_changed(self):
+        """番組表の文字サイズ設定切り替え時: 設定を保存し、フォント・グリッドを再構築する"""
+        self.manager.save_settings({'schedule_font_size': self.schedule_font_size_var.get()})
+        self._apply_schedule_font_size()
+        self.display_schedule(self._current_programs, mode=self.schedule_mode_var.get())
+
     def _get_schedule_colors(self):
         """現在のテーマ（ライト/ダーク）に応じた番組表グリッドの配色を返す"""
         if self.theme_var.get() == "dark":
@@ -699,6 +738,10 @@ class RecRApp:
                 'future_outline': '#5b8fc2',
                 'past_fill': '#3a3a3a',
                 'past_outline': '#5a5a5a',
+                # タイムフリーモードで、当日中のまだ放送されていない番組用
+                # （斜線ハッチング風に見えるよう、はっきり別系統の色にする）
+                'unavailable_fill': '#4a2f2f',
+                'unavailable_outline': '#8a5a5a',
                 'title': '#eaeaea',
                 'title_link': '#78b3ff',
                 'desc': '#b5b5b5',
@@ -712,6 +755,8 @@ class RecRApp:
             'future_outline': '#7fa8c9',
             'past_fill': '#d9d9d9',
             'past_outline': '#aaaaaa',
+            'unavailable_fill': '#f7e6e6',
+            'unavailable_outline': '#c98a8a',
             'title': '#222222',
             'title_link': '#1a5fb4',
             'desc': '#666666',
@@ -1144,6 +1189,13 @@ class RecRApp:
             value="timefree", command=self.on_schedule_mode_changed
         ).pack(side=tk.LEFT, padx=(5, 0))
 
+        ttk.Label(control_frame, text="文字サイズ：").pack(side=tk.LEFT, padx=(15, 0))
+        for value, label in (('small', '小'), ('medium', '中'), ('large', '大')):
+            ttk.Radiobutton(
+                control_frame, text=label, variable=self.schedule_font_size_var,
+                value=value, command=self._on_schedule_font_size_changed
+            ).pack(side=tk.LEFT)
+
         self.search_toggle_button = ttk.Button(
             control_frame,
             text="検索 ▼",
@@ -1188,11 +1240,12 @@ class RecRApp:
         )
 
         self._tooltip = None
-        self.schedule_title_font = tkfont.Font(family="Yu Gothic UI", size=8)
+        self.schedule_title_font = tkfont.Font(family="Yu Gothic UI", size=self.SCHEDULE_BASE_TITLE_SIZE)
         self.schedule_title_link_font = tkfont.Font(
-            family="Yu Gothic UI", size=8, underline=1
+            family="Yu Gothic UI", size=self.SCHEDULE_BASE_TITLE_SIZE, underline=1
         )
-        self.schedule_desc_font = tkfont.Font(family="Yu Gothic UI", size=7)
+        self.schedule_desc_font = tkfont.Font(family="Yu Gothic UI", size=self.SCHEDULE_BASE_DESC_SIZE)
+        self._apply_schedule_font_size()
         self._image_cache = {}
         self._program_canvas_items = {}
         self._schedule_grid_height = 0
@@ -1515,6 +1568,17 @@ class RecRApp:
             return
 
         now = datetime.now()
+        if now < start_dt:
+            # 放送前の番組はまだradiko側にタイムフリー音声が存在しない。取得を
+            # 試みると失敗するのではなく、現在ライブ中の別番組の内容が誤って
+            # 取得されてしまうことを実機で確認したため、事前にブロックする
+            messagebox.showinfo(
+                "タイムフリー",
+                f"「{title}」はまだ放送されていないため、タイムフリーで取得できません。\n"
+                "放送終了後に改めてお試しください。"
+            )
+            return
+
         if now - end_dt > timedelta(days=7):
             messagebox.showinfo(
                 "タイムフリー",
@@ -2873,6 +2937,24 @@ class RecRApp:
             # 前のステーションの番組表が残らないようクリア
             self.display_schedule([])
 
+    def _has_programs_in_timefree_window(self, programs):
+        """programsの中に、タイムフリー対象期間（当日を含む過去7日間）に入っている
+        番組が1件でもあるか判定する。
+
+        タイムフリーのキャッシュは日付が固定なので、キャッシュ自体は存在していても、
+        7日以上前に取得したまま更新していないと、対象期間が丸ごと過ぎ去ってしまい
+        display_scheduleの日付フィルタで全件除外されて空グリッドになる
+        （実際に、9日前に取得したキャッシュを持つ局でこれが発生した）。
+        そのため「キャッシュがあるか」だけでなく「今の対象期間内のデータが
+        残っているか」まで見て、再取得を促すかどうかを判断する
+        """
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        cutoff_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        return any(
+            p.get('date_iso') and cutoff_iso <= p['date_iso'] <= today_iso
+            for p in programs
+        )
+
     def load_timefree_schedule_for_current_station(self):
         """選択中のステーションのタイムフリー対象期間（過去7日間）の番組表を表示する。
         キャッシュがあればそれを表示、なければ取得を確認するダイアログを出す
@@ -2884,7 +2966,7 @@ class RecRApp:
         station = self.schedule_station_var.get()
         cache_key = f"{station}::timefree"
         cached = self.manager.load_cached_schedule(cache_key)
-        if cached:
+        if cached and self._has_programs_in_timefree_window(cached):
             self.display_schedule(cached, mode='timefree')
             return
 
@@ -2916,7 +2998,24 @@ class RecRApp:
         self.manager.save_schedule_cache(station, programs)
         if success:
             self._scan_freewords_and_refresh(station, programs)
+        # 通常の番組表と同じタイミングで、タイムフリー（過去7日間）のキャッシュも
+        # 一緒に更新する（開いたことのない局のタイムフリーがいつまでも古いまま
+        # 残ってしまわないようにするため）。失敗しても通常の番組表更新自体は
+        # 失敗扱いにしないベストエフォート
+        self._fetch_and_cache_timefree_schedule(station)
         return programs, success
+
+    def _fetch_and_cache_timefree_schedule(self, station):
+        """指定局のタイムフリー（過去7日間）番組表を取得してキャッシュに保存する
+
+        fetch_and_cache_schedule（通常の番組表更新）から常に一緒に呼ばれる。
+        """
+        try:
+            timefree_programs = self.manager.get_timefree_schedule(station)
+            if timefree_programs:
+                self.manager.save_schedule_cache(f"{station}::timefree", timefree_programs)
+        except Exception:
+            logger.exception(f"タイムフリー番組表の更新に失敗しました: {station}")
 
     def _scan_freewords_and_refresh(self, station, programs):
         """番組表更新後: フリーワードと照合して新規予約を自動作成し、
@@ -3013,6 +3112,13 @@ class RecRApp:
     def _full_schedule_refresh_worker(self, stations, today_iso):
         """バックグラウンドスレッド本体: 全局を順に取得し、フリーワード照合も行う。
         Tkinterウィジェットには一切触れず、完了後の反映は root.after 経由で行う。
+
+        通常の番組表（未来方向）だけでなく、タイムフリー対象期間（過去7日間）の
+        番組表もここで一緒に更新する。タイムフリーのキャッシュは以前、この自動更新の
+        対象に一切含まれておらず、該当局のタイムフリータブを開かない限り何日経っても
+        更新されなかった（対象期間を丸ごと過ぎ去ってから開くと空の番組表になる）ため
+        追加した。フリーワードによる自動予約作成は未来の番組のみが対象なので、
+        タイムフリー側ではキャッシュの保存のみ行い、フリーワード照合は行わない。
         """
         logger.info(f"全局番組表自動更新を開始します（{len(stations)}局）")
         failed_stations = []
@@ -3022,18 +3128,26 @@ class RecRApp:
                 programs = self.manager.get_program_schedule(station, days=self.SCHEDULE_FETCH_DAYS)
                 if not programs:
                     failed_stations.append(station)
-                    continue
-                self.manager.save_schedule_cache(station, programs)
-                if self.manager.scan_freewords_for_station(station, programs):
-                    any_created = True
+                else:
+                    self.manager.save_schedule_cache(station, programs)
+                    if self.manager.scan_freewords_for_station(station, programs):
+                        any_created = True
             except Exception as e:
                 failed_stations.append(f"{station}（{e}）")
+
+            try:
+                timefree_programs = self.manager.get_timefree_schedule(station)
+                if not timefree_programs:
+                    failed_stations.append(f"{station}（タイムフリー）")
+                else:
+                    self.manager.save_schedule_cache(f"{station}::timefree", timefree_programs)
+            except Exception as e:
+                failed_stations.append(f"{station}（タイムフリー: {e}）")
 
         self.manager.prune_stale_schedule_cache()
         self.manager.save_settings({'last_full_schedule_refresh_date': today_iso})
         logger.info(
-            f"全局番組表自動更新が完了しました（成功{len(stations) - len(failed_stations)}局 / "
-            f"失敗{len(failed_stations)}局）"
+            f"全局番組表自動更新が完了しました（失敗{len(failed_stations)}件）"
         )
         self.root.after(0, self._on_full_schedule_refresh_done, failed_stations, any_created)
 
@@ -3045,7 +3159,11 @@ class RecRApp:
             self._refresh_reservation_list()
 
         station = self.schedule_station_var.get()
-        if self.schedule_mode_var.get() != 'timefree':
+        if self.schedule_mode_var.get() == 'timefree':
+            cached = self.manager.load_cached_schedule(f"{station}::timefree")
+            if cached and self._has_programs_in_timefree_window(cached):
+                self.display_schedule(cached, mode='timefree')
+        else:
             cached = self.manager.load_cached_schedule(station)
             if cached:
                 self.display_schedule(cached)
@@ -3164,10 +3282,15 @@ class RecRApp:
                 if p.get('date_iso') is None or p['date_iso'] >= today_iso
             ]
 
-        # 日付ごとにグループ化（取得順を維持）
+        # 日付ごとにグループ化
         days = {}
         for program in programs:
             days.setdefault(program['date'], []).append(program)
+
+        # 列は日付の古い順（左が過去、右が現在/未来）に並べる。通常モードは
+        # 取得順が既にその順（今日→未来）だが、タイムフリーは取得順が
+        # 「今日→過去」のため、date_isoで明示的に並べ替えないと左右が逆になる
+        days = dict(sorted(days.items(), key=lambda kv: kv[1][0].get('date_iso') or ''))
 
         num_cols = max(len(days), 1)
         grid_height = int(24 * 60 * self.PIXELS_PER_MINUTE)
@@ -3182,7 +3305,8 @@ class RecRApp:
             canvas.create_line(self.TIME_LABEL_WIDTH, y, grid_width, y, fill=colors['hour_line'])
             canvas.create_text(
                 4, y + 2, text=f"{label_hour:02d}:00",
-                anchor=tk.NW, font=("Yu Gothic UI", 8), fill=colors['time_label']
+                anchor=tk.NW, font=("Yu Gothic UI", self._schedule_hour_label_size),
+                fill=colors['time_label']
             )
 
         # 日付ヘッダー側に時刻ラベル分の幅を合わせるスペーサー
@@ -3216,7 +3340,9 @@ class RecRApp:
             header_cell.pack(side=tk.LEFT, fill=tk.Y)
             header_cell.pack_propagate(False)
             ttk.Label(
-                header_cell, text=date_label, font=("Yu Gothic UI", 9, "bold"), anchor=tk.W, padding=(4, 0)
+                header_cell, text=date_label,
+                font=("Yu Gothic UI", self._schedule_date_header_size, "bold"),
+                anchor=tk.W, padding=(4, 0)
             ).pack(expand=True, fill=tk.BOTH)
 
             # 当日の列かどうか（当日の列内のみ、終了済み番組をグレーアウトする）
@@ -3233,9 +3359,26 @@ class RecRApp:
                 x1 = col_left + 2
                 x2 = col_left + self.DAY_COLUMN_WIDTH - 2
 
+                # タイムフリーモードでも、当日分は放送前の番組が含まれ得る。
+                # 放送前の番組はまだradiko側にタイムフリー音声が存在せず、
+                # 取得しようとすると失敗するのではなく現在ライブ中の別番組の
+                # 内容が誤って取得されることを実機で確認したため、区別して
+                # 見た目を変え、ダウンロードもできないようにする
+                not_yet_aired = False
+                if mode == 'timefree':
+                    start_dt, _ = self._program_air_window(program)
+                    not_yet_aired = start_dt is not None and now < start_dt
+
                 is_past = mode == 'timefree' or (is_today_col and end_minutes <= now_minutes)
-                fill_color = colors['past_fill'] if is_past else colors['future_fill']
-                outline_color = colors['past_outline'] if is_past else colors['future_outline']
+                if not_yet_aired:
+                    fill_color = colors['unavailable_fill']
+                    outline_color = colors['unavailable_outline']
+                elif is_past:
+                    fill_color = colors['past_fill']
+                    outline_color = colors['past_outline']
+                else:
+                    fill_color = colors['future_fill']
+                    outline_color = colors['future_outline']
 
                 rect = canvas.create_rectangle(
                     x1, y1, x2, y2, fill=fill_color, outline=outline_color
