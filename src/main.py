@@ -2584,6 +2584,16 @@ class RecRApp:
             }
             if repeat_var.get() == 'weekly':
                 new_data['weekday'] = list(self.manager.WEEKDAY_JA).index(weekday_var.get())
+                if existing and existing.get('source') == 'freeword':
+                    # フリーワード由来の単発予約を毎週予約に切り替えた場合、
+                    # source/keyword_idを残したままだと、この予約のdate_isoが
+                    # 元の1回分の放送日のまま更新されないため、フリーワードの
+                    # 重複判定（局・放送日・開始時刻・番組名が一致するか）に
+                    # 毎回ひっかからず、同じキーワードに一致する将来の回を
+                    # 別の単発予約として際限なく自動作成し続けてしまう。
+                    # 毎週予約への切り替え後は手動管理の予約として扱う
+                    new_data['source'] = None
+                    new_data['keyword_id'] = None
             else:
                 date_text = date_var.get().strip()
                 try:

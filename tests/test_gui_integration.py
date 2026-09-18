@@ -227,6 +227,66 @@ def test_menu_checkbutton_indicator_is_visible_against_menu_background(app):
             )
 
 
+def _find_widgets(root, cls_name=None, text=None):
+    """widget木を再帰的に探索し、クラス名/textが一致するウィジェットを全て返す"""
+    results = []
+    for child in root.winfo_children():
+        matches = True
+        if cls_name is not None and child.winfo_class() != cls_name:
+            matches = False
+        if matches and text is not None:
+            try:
+                if str(child.cget('text')) != text:
+                    matches = False
+            except tk.TclError:
+                matches = False
+        if matches:
+            results.append(child)
+        results.extend(_find_widgets(child, cls_name, text))
+    return results
+
+
+def test_editing_freeword_reservation_to_weekly_clears_freeword_source(app):
+    """フリーワード由来の単発予約を編集ダイアログで「毎週」に切り替えて保存すると、
+    source/keyword_idがクリアされ、以後は通常の手動予約として扱われること。
+
+    クリアしないと、この予約のdate_isoが元の1回分の放送日のまま更新されないため、
+    フリーワードの重複判定に毎回ひっかからず、同じキーワードに一致する将来の回を
+    別の単発予約として際限なく自動作成し続けてしまう不具合があった
+    """
+    reservation = app.manager.add_reservation({
+        'station': 'TBSラジオ', 'repeat': 'once', 'date_iso': '2026-09-01',
+        'start': '05:00', 'end': '06:00', 'title': 'テスト番組',
+        'source': 'freeword', 'keyword_id': 'kw1',
+    })
+
+    toplevels_before = set(app.root.winfo_children())
+    app._open_reservation_dialog(existing=reservation)
+    new_toplevels = [
+        w for w in app.root.winfo_children()
+        if w not in toplevels_before and isinstance(w, tk.Toplevel)
+    ]
+    assert len(new_toplevels) == 1, "予約編集ダイアログが開かれていない"
+    dialog = new_toplevels[0]
+
+    try:
+        weekly_radios = _find_widgets(dialog, cls_name="TRadiobutton", text="毎週")
+        assert weekly_radios, "「毎週」ラジオボタンが見つからない"
+        weekly_radios[0].invoke()
+
+        save_buttons = _find_widgets(dialog, cls_name="TButton", text="保存")
+        assert save_buttons, "「保存」ボタンが見つからない"
+        save_buttons[0].invoke()
+    finally:
+        if dialog.winfo_exists():
+            dialog.destroy()
+
+    updated = app.manager.get_reservation(reservation['id'])
+    assert updated['repeat'] == 'weekly'
+    assert updated.get('source') is None
+    assert updated.get('keyword_id') is None
+
+
 def _canvas_texts(canvas):
     return [
         canvas.itemcget(item, "text")
