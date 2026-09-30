@@ -418,8 +418,10 @@ def test_timefree_schedule_uses_cache_when_still_within_window(app, monkeypatch)
     再取得を促さずそのキャッシュをそのまま使うこと（正常系の回帰防止）
     """
     station = "TBSラジオ"
+    # 対象期間（今日を含む過去7日間）に必ず収まるよう、実行時の日付から相対的に決める
+    recent_date_iso = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
     fresh_cached = [{
-        'date': '9/17(木)', 'date_iso': '2026-09-17', 'start': '05:00', 'end': '06:00',
+        'date': recent_date_iso, 'date_iso': recent_date_iso, 'start': '05:00', 'end': '06:00',
         'title': '期間内のキャッシュ番組',
     }]
     app.manager.save_schedule_cache(f"{station}::timefree", fresh_cached)

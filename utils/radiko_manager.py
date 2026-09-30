@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -119,6 +120,11 @@ class RadikoManager:
     # グラフィックイコライザー表示用の周波数バンド数
     EQ_NUM_BANDS = 10
 
+    # 番組表取得（1局分）で、複数日を同時に取得する際の並列数。
+    # radiko側のレスポンスが遅いため並列化するが、上げすぎると相手サーバーに
+    # 負荷をかけるため控えめな値にしている。
+    SCHEDULE_DAY_FETCH_WORKERS = 5
+
     def __init__(self):
         self.radiko_api_url = "https://radiko.jp/v3/program/station/date"
         self.auth1_url = "https://radiko.jp/v2/api/auth1"
@@ -164,10 +170,21 @@ class RadikoManager:
 
         self.cache_dir = get_base_dir() / "config"
         self.cache_file = self.cache_dir / "schedule_cache.json"
+        # schedule_cache.jsonはキャッシュ済み局が増えると数MBになり、
+        # 毎回ディスクから読み直してJSONパースし直すコストが無視できない。
+        # 起動時の複数局チェックやフリーワード再照合など、短時間に局数分だけ
+        # 繰り返し読む処理があるため、ファイルが変わっていない間はプロセス内の
+        # メモリキャッシュを返す（更新はmtimeで検知）
+        self._schedule_cache_mem = None
+        self._schedule_cache_mtime = None
         self.image_cache_dir = self.cache_dir / "images"
         self.settings_file = self.cache_dir / "settings.json"
         self.reservations_file = self.cache_dir / "reservations.json"
         self.freeword_file = self.cache_dir / "freeword_keywords.json"
+        # 設定・予約一覧・フリーワード一覧をまとめた自動バックアップ（VerUP時の再設定を
+        # 楽にするため、いずれかが変更されるたびに書き出す。手動エクスポート/インポート
+        # とは別に、常に最新状態を保持する）
+        self.export_file = self.cache_dir / "settings_export.json"
 
     def _authenticate(self):
         """radikoのauth1/auth2を実行し、接続元IPからエリアを判定する
@@ -243,20 +260,46 @@ class RadikoManager:
             return None
 
     def _load_cache_file(self):
-        """キャッシュファイル全体を読み込む（存在しない/壊れている場合は空dict）"""
+        """キャッシュファイル全体を読み込む（存在しない/壊れている場合は空dict）
+
+        ファイルのmtimeが前回読み込み時と同じならメモリキャッシュを返し、
+        ディスクI/OとJSONパースを省略する。呼び出し元が戻り値の辞書を
+        直接書き換えてもメモリキャッシュ側に影響しないよう、浅いコピーを返す
+        （値であるステーションごとの辞書は差し替えのみで直接編集されない前提）。
+        """
         if not self.cache_file.exists():
+            self._schedule_cache_mem = {}
+            self._schedule_cache_mtime = None
             return {}
+
+        try:
+            mtime = self.cache_file.stat().st_mtime
+        except OSError:
+            mtime = None
+
+        if self._schedule_cache_mem is not None and mtime == self._schedule_cache_mtime:
+            return dict(self._schedule_cache_mem)
+
         try:
             with open(self.cache_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            return {}
+            data = {}
+
+        self._schedule_cache_mem = data
+        self._schedule_cache_mtime = mtime
+        return dict(data)
 
     def _save_cache_file(self, cache):
         """キャッシュファイル全体を書き込む"""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         with open(self.cache_file, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+        self._schedule_cache_mem = cache
+        try:
+            self._schedule_cache_mtime = self.cache_file.stat().st_mtime
+        except OSError:
+            self._schedule_cache_mtime = None
 
     def load_cached_schedule(self, station_name):
         """ステーションのキャッシュ済み番組表を読み込む
@@ -387,6 +430,25 @@ class RadikoManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         with open(self.settings_file, "w", encoding="utf-8") as f:
             json.dump(current, f, ensure_ascii=False, indent=2)
+        self._export_backup()
+
+    def _export_backup(self):
+        """設定・予約一覧・フリーワード一覧をまとめて自動バックアップファイルに書き出す
+
+        設定変更時、および予約一覧・フリーワード一覧の更新時に毎回呼び出される。
+        書き込みに失敗してもアプリ本来の動作は継続させたいため、例外は握りつぶす。
+        """
+        data = {
+            "settings": self.load_settings(),
+            "reservations": self._load_reservations_file(),
+            "freeword_keywords": self._load_freeword_file(),
+        }
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.export_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            logger.exception("Error writing settings_export.json backup")
 
     # 予約時刻を過ぎてもスケジューラの巡回間隔等の遅れを許容して録音を開始する猶予（秒）
     RESERVATION_GRACE_SECONDS = 180
@@ -404,6 +466,11 @@ class RadikoManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         with open(self.reservations_file, "w", encoding="utf-8") as f:
             json.dump(reservations, f, ensure_ascii=False, indent=2)
+        self._export_backup()
+
+    def replace_reservations(self, reservations):
+        """予約録音の一覧を丸ごと置き換える（設定インポート用）"""
+        self._save_reservations_file(reservations)
 
     def load_reservations(self):
         """予約録音の一覧を読み込む"""
@@ -532,6 +599,11 @@ class RadikoManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         with open(self.freeword_file, "w", encoding="utf-8") as f:
             json.dump(freewords, f, ensure_ascii=False, indent=2)
+        self._export_backup()
+
+    def replace_freewords(self, freewords):
+        """フリーワードの一覧を丸ごと置き換える（設定インポート用）"""
+        self._save_freeword_file(freewords)
 
     def load_freewords(self):
         """フリーワード（キーワード自動録音）の一覧を読み込む"""
@@ -1842,16 +1914,22 @@ class RadikoManager:
 
     WEEKDAY_JA = ['月', '火', '水', '木', '金', '土', '日']
 
-    def _fetch_day_programs(self, station_id, target_date):
+    def _fetch_day_programs(self, station_id, target_date, cancel_event=None):
         """指定局・指定日（datetime）1日分の番組表を取得してパースする
 
         get_program_schedule（未来方向）と get_timefree_schedule（過去方向）の
         どちらからも呼ばれる共通処理。番組表APIのURL構築・XMLパースは対象日の
         前後に関わらず同じ形式のため、日付計算部分だけを呼び出し元で変える。
 
+        cancel_event が指定され、かつセットされている場合は通信を行わず
+        空リストを返す（呼び出し元の並列取得ループで早期に打ち切るため）。
+
         Returns:
             list: get_program_schedule と同じ形式の辞書のリスト（取得失敗時は空リスト）
         """
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
         date_str = target_date.strftime("%Y%m%d")
         date_label = f"{target_date.month}/{target_date.day}({self.WEEKDAY_JA[target_date.weekday()]})"
         date_iso = target_date.strftime("%Y-%m-%d")
@@ -1909,7 +1987,32 @@ class RadikoManager:
 
         return programs
 
-    def get_program_schedule(self, station_name, days=10):
+    def _fetch_days_parallel(self, station_id, target_dates, cancel_event=None):
+        """複数日分の番組表を並列取得し、日付順に結合して返す（内部共通処理）
+
+        radiko側のレスポンスが遅く1リクエストあたり数秒かかるため、日ごとに
+        直列で待つと局あたりの取得に時間がかかる。ThreadPoolExecutorで並列に
+        投げることでI/O待ち時間を重ね合わせる。
+        """
+        results = [[] for _ in target_dates]
+        with ThreadPoolExecutor(max_workers=self.SCHEDULE_DAY_FETCH_WORKERS) as executor:
+            future_to_index = {
+                executor.submit(self._fetch_day_programs, station_id, target_date, cancel_event): i
+                for i, target_date in enumerate(target_dates)
+            }
+            for future in future_to_index:
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception:
+                    logger.exception(f"Error fetching schedule day (index={index})")
+
+        programs = []
+        for day_programs in results:
+            programs.extend(day_programs)
+        return programs
+
+    def get_program_schedule(self, station_name, days=10, cancel_event=None):
         """ラジコから番組表を取得
 
         Args:
@@ -1917,6 +2020,8 @@ class RadikoManager:
             days (int): 取得する日数（デフォルト: 10日分。radikoは実際には
                 日によって最大13日程度先まで応答するが、直近以外は仮の定型
                 スケジュールの割合が増えるため10日を既定値にしている）
+            cancel_event (threading.Event, optional): セットされている場合、
+                未着手の日の取得を打ち切って現時点までの結果を返す
 
         Returns:
             list: [
@@ -1939,13 +2044,9 @@ class RadikoManager:
                 logger.warning(f"番組表取得失敗: 局が見つかりません ({station_name})")
                 return []
 
-            programs = []
             now = datetime.now()
-
-            # 今日から指定日数分の番組表を取得
-            for day_offset in range(days):
-                target_date = now + timedelta(days=day_offset)
-                programs.extend(self._fetch_day_programs(station_id, target_date))
+            target_dates = [now + timedelta(days=day_offset) for day_offset in range(days)]
+            programs = self._fetch_days_parallel(station_id, target_dates, cancel_event)
 
             logger.info(f"番組表取得完了: {station_name} ({len(programs)}件)")
             return programs
@@ -1954,13 +2055,15 @@ class RadikoManager:
             logger.exception(f"Error in get_program_schedule: {station_name}")
             return []
 
-    def get_timefree_schedule(self, station_name, days_back=7):
+    def get_timefree_schedule(self, station_name, days_back=7, cancel_event=None):
         """ラジコのタイムフリー対象期間（過去 days_back 日分、当日を含む）の番組表を取得
 
         Args:
             station_name (str): ステーション名
             days_back (int): 遡る日数（デフォルト7日。radikoのタイムフリーは
                 放送から概ね1週間で聴取期限が切れるため）
+            cancel_event (threading.Event, optional): セットされている場合、
+                未着手の日の取得を打ち切って現時点までの結果を返す
 
         Returns:
             list: get_program_schedule と同じ形式の辞書のリスト
@@ -1972,12 +2075,9 @@ class RadikoManager:
                 logger.warning(f"タイムフリー番組表取得失敗: 局が見つかりません ({station_name})")
                 return []
 
-            programs = []
             now = datetime.now()
-
-            for day_offset in range(days_back):
-                target_date = now - timedelta(days=day_offset)
-                programs.extend(self._fetch_day_programs(station_id, target_date))
+            target_dates = [now - timedelta(days=day_offset) for day_offset in range(days_back)]
+            programs = self._fetch_days_parallel(station_id, target_dates, cancel_event)
 
             logger.info(f"タイムフリー番組表取得完了: {station_name} ({len(programs)}件)")
             return programs

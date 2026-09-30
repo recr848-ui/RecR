@@ -12,6 +12,7 @@ from pathlib import Path
 import calendar
 import ctypes
 import io
+import json
 import logging
 import math
 import os
@@ -19,6 +20,7 @@ import re
 import sys
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 
 # Windows の電源管理API（SetThreadExecutionState）用フラグ。
 # 予約録音を控えている間・録音中は、アイドルによる自動スリープを抑止するために使う。
@@ -64,6 +66,10 @@ class RecRApp:
     # 番組表の取得日数、および自動更新のしきい値
     SCHEDULE_FETCH_DAYS = 10
     SCHEDULE_STALE_THRESHOLD_DAYS = 4
+
+    # 複数局の番組表を一括取得する際、同時に取得する局数（並列ワーカー数）。
+    # radiko側の負荷を考えて控えめな値にしている。
+    SCHEDULE_STATION_FETCH_WORKERS = 4
 
     # 全局番組表の1日1回自動更新を行う時刻（"HH:MM"形式。この時刻を過ぎた状態で
     # アプリが起動していれば、その日のうちに実行される）。フリーワード予約が
@@ -646,6 +652,11 @@ class RecRApp:
             label="予約待機中・録音中は自動スリープを抑止する",
             variable=self.prevent_sleep_var, command=self._on_prevent_sleep_changed
         )
+
+        settings_menu.add_separator()
+        settings_menu.add_command(label="設定をエクスポート...", command=self._export_settings)
+        settings_menu.add_command(label="設定をインポート...", command=self._import_settings)
+
         menubar.add_cascade(label="設定", menu=settings_menu)
 
         self.root.config(menu=menubar)
@@ -710,6 +721,7 @@ class RecRApp:
         文字を大きくしても番組枠からはみ出しにくくしている。
         """
         delta = self.SCHEDULE_FONT_SIZE_DELTA.get(self.schedule_font_size_var.get(), 0)
+        self._schedule_font_size_key = delta
         title_size = self.SCHEDULE_BASE_TITLE_SIZE + delta
         self.schedule_title_font.configure(size=title_size)
         self.schedule_title_link_font.configure(size=title_size)
@@ -742,6 +754,7 @@ class RecRApp:
                 # （斜線ハッチング風に見えるよう、はっきり別系統の色にする）
                 'unavailable_fill': '#4a2f2f',
                 'unavailable_outline': '#8a5a5a',
+                'reserved_outline': '#ff8c3f',
                 'title': '#eaeaea',
                 'title_link': '#78b3ff',
                 'desc': '#b5b5b5',
@@ -757,6 +770,7 @@ class RecRApp:
             'past_outline': '#aaaaaa',
             'unavailable_fill': '#f7e6e6',
             'unavailable_outline': '#c98a8a',
+            'reserved_outline': '#e2690a',
             'title': '#222222',
             'title_link': '#1a5fb4',
             'desc': '#666666',
@@ -767,6 +781,79 @@ class RecRApp:
         output_dir = self.manager.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(output_dir))
+
+    def _export_settings(self):
+        """現在の設定・予約一覧・フリーワード一覧をユーザー指定のJSONファイルに書き出す"""
+        dest = filedialog.asksaveasfilename(
+            title="設定のエクスポート先を選択",
+            defaultextension=".json",
+            filetypes=[("JSONファイル", "*.json")],
+            initialfile="RecR_settings.json",
+        )
+        if not dest:
+            return
+        data = {
+            "settings": self.manager.load_settings(),
+            "reservations": self.manager.load_reservations(),
+            "freeword_keywords": self.manager.load_freewords(),
+        }
+        try:
+            with open(dest, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            messagebox.showerror("設定のエクスポート", f"書き出しに失敗しました:\n{e}")
+            return
+        messagebox.showinfo(
+            "設定のエクスポート",
+            f"設定・予約一覧・フリーワード一覧を書き出しました:\n{dest}"
+        )
+
+    def _import_settings(self):
+        """ユーザー指定のJSONファイルから設定・予約一覧・フリーワード一覧を読み込む
+
+        エクスポート機能で書き出した新形式（settings/reservations/freeword_keywords
+        をまとめたdict）と、設定のみのフラットな旧形式の両方を受け付ける。
+        録音保存先など一部の設定は起動時にのみ反映されるため、インポート後は
+        アプリの再起動を促す。
+        """
+        src = filedialog.askopenfilename(
+            title="インポートする設定ファイルを選択",
+            filetypes=[("JSONファイル", "*.json")],
+        )
+        if not src:
+            return
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                imported = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            messagebox.showerror("設定のインポート", f"読み込みに失敗しました:\n{e}")
+            return
+        if not isinstance(imported, dict):
+            messagebox.showerror("設定のインポート", "設定ファイルの形式が不正です。")
+            return
+
+        is_bundled = any(
+            key in imported for key in ("settings", "reservations", "freeword_keywords")
+        )
+        settings = imported.get("settings", {}) if is_bundled else imported
+        reservations = imported.get("reservations") if is_bundled else None
+        freewords = imported.get("freeword_keywords") if is_bundled else None
+
+        if not messagebox.askyesno(
+            "設定のインポート",
+            "現在の設定・予約一覧・フリーワード一覧を選択したファイルの内容で上書きします。\n"
+            "変更を完全に反映するにはアプリの再起動が必要です。続行しますか？"
+        ):
+            return
+        self.manager.save_settings(settings)
+        if reservations is not None:
+            self.manager.replace_reservations(reservations)
+        if freewords is not None:
+            self.manager.replace_freewords(freewords)
+        messagebox.showinfo(
+            "設定のインポート",
+            "インポートしました。\n変更を反映するにはRecRを再起動してください。"
+        )
 
     def _change_output_dir(self):
         """録音ファイルの保存先フォルダを選び直す"""
@@ -895,8 +982,92 @@ class RecRApp:
                 continue
             return value
 
+    def _open_schedule_fetch_progress_dialog(self, title):
+        """番組表取得中に表示する進捗ダイアログを開く
+
+        「キャンセル」ボタンを押すと戻り値のイベントがセットされ、以降まだ
+        着手していない局・日の取得が順次打ち切られる（実行中のリクエストは
+        完了を待つため、キャンセル後も少しの間だけ処理が続くことがある）。
+
+        Returns:
+            (tk.Toplevel, tk.StringVar, ttk.Progressbar, threading.Event)
+        """
+        cancel_event = threading.Event()
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        progress_var = tk.StringVar(value="準備中...")
+        ttk.Label(frame, textvariable=progress_var, justify=tk.LEFT, width=42).pack(
+            anchor=tk.W, pady=(0, 12)
+        )
+
+        progressbar = ttk.Progressbar(frame, mode='determinate', length=300)
+        progressbar.pack(fill=tk.X, pady=(0, 15))
+
+        def on_cancel():
+            cancel_event.set()
+            cancel_button.configure(state='disabled', text="キャンセル中...")
+
+        cancel_button = ttk.Button(frame, text="キャンセル", command=on_cancel)
+        cancel_button.pack()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        self._center_dialog_over_parent(dialog)
+        dialog.deiconify()
+        dialog.grab_set()
+
+        return dialog, progress_var, progressbar, cancel_event
+
+    def _update_schedule_fetch_progress(self, progress_var, progressbar, completed, total, station):
+        """進捗ダイアログの表示を更新する（メインスレッドから呼ばれる）"""
+        progress_var.set(f"{completed}/{total}局  {station} 完了")
+        progressbar.configure(value=completed)
+
+    def _fetch_and_cache_schedule_no_ui(self, station, cancel_event):
+        """番組表とタイムフリー番組表を取得してキャッシュに保存する（バックグラウンドスレッド用）
+
+        fetch_and_cache_schedule と異なり、Tkinterウィジェットには一切触れない
+        （フリーワード一致の有無だけを返し、予約一覧UIへの反映は呼び出し元が
+        メインスレッドでまとめて行う）。
+
+        Returns:
+            (bool success, bool any_created, str or None error_label)
+        """
+        try:
+            programs = self.manager.get_program_schedule(
+                station, days=self.SCHEDULE_FETCH_DAYS, cancel_event=cancel_event
+            )
+            success = bool(programs)
+            if not programs:
+                programs = self.manager.get_sample_schedule(station, days=self.SCHEDULE_FETCH_DAYS)
+            self.manager.save_schedule_cache(station, programs)
+            any_created = success and self.manager.scan_freewords_for_station(station, programs)
+        except Exception as e:
+            return False, False, f"{station}（{e}）"
+
+        if not cancel_event.is_set():
+            try:
+                timefree_programs = self.manager.get_timefree_schedule(station, cancel_event=cancel_event)
+                if timefree_programs:
+                    self.manager.save_schedule_cache(f"{station}::timefree", timefree_programs)
+            except Exception:
+                logger.exception(f"タイムフリー番組表の更新に失敗しました: {station}")
+
+        return success, any_created, (None if success else station)
+
     def _bulk_refresh_schedules(self):
-        """全ステーションの番組表を一括で再取得してキャッシュを更新する"""
+        """全ステーションの番組表を一括で再取得してキャッシュを更新する
+
+        局ごとに独立したHTTPリクエストであるため、複数局を同時に並列取得する
+        ことで所要時間を短縮する（詳細は SCHEDULE_STATION_FETCH_WORKERS）。
+        """
         if not messagebox.askyesno(
             "番組表の一括更新",
             "すべてのステーションの番組表を再取得します。時間がかかる場合があります。よろしいですか？"
@@ -904,27 +1075,53 @@ class RecRApp:
             return
 
         stations = self.manager.get_stations()
-        total = len(stations)
-        original_status = self.status_var.get()
-        failed_stations = []
-        self._set_app_busy(True)
-        try:
-            for i, station in enumerate(stations, start=1):
-                self.status_var.set(f"{i}/{total}局  {station}取得中")
-                self.root.update_idletasks()
-                try:
-                    _, success = self.fetch_and_cache_schedule(station)
-                    if not success:
-                        failed_stations.append(station)
-                except Exception as e:
-                    failed_stations.append(f"{station}（{e}）")
-        finally:
-            self.status_var.set(original_status)
-            self._set_app_busy(False)
+        dialog, progress_var, progressbar, cancel_event = self._open_schedule_fetch_progress_dialog(
+            "番組表の一括更新"
+        )
+        progressbar.configure(maximum=len(stations))
+        progress_var.set(f"0/{len(stations)}局 取得中...")
 
+        def worker():
+            failed_stations = []
+            any_created = False
+            completed = 0
+            lock = threading.Lock()
+
+            def fetch_one(station):
+                nonlocal completed, any_created
+                if cancel_event.is_set():
+                    return
+                success, created, error_label = self._fetch_and_cache_schedule_no_ui(station, cancel_event)
+                with lock:
+                    if not success:
+                        failed_stations.append(error_label)
+                    if created:
+                        any_created = True
+                    completed += 1
+                    n = completed
+                self.root.after(
+                    0, self._update_schedule_fetch_progress, progress_var, progressbar, n, len(stations), station
+                )
+
+            with ThreadPoolExecutor(max_workers=self.SCHEDULE_STATION_FETCH_WORKERS) as executor:
+                list(executor.map(fetch_one, stations))
+
+            self.root.after(0, self._on_bulk_refresh_done, dialog, cancel_event.is_set(), failed_stations, any_created)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bulk_refresh_done(self, dialog, cancelled, failed_stations, any_created):
+        """番組表一括更新の完了処理（メインスレッドで実行）"""
+        dialog.grab_release()
+        dialog.destroy()
+
+        if any_created:
+            self._refresh_reservation_list()
         self.load_schedule_for_current_station()
 
-        if failed_stations:
+        if cancelled:
+            messagebox.showinfo("番組表の一括更新", "取得をキャンセルしました。")
+        elif failed_stations:
             messagebox.showwarning(
                 "番組表の一括更新",
                 "以下の局は番組表の取得に失敗しました（サンプルデータで代用しています）:\n\n"
@@ -1247,6 +1444,7 @@ class RecRApp:
         self.schedule_desc_font = tkfont.Font(family="Yu Gothic UI", size=self.SCHEDULE_BASE_DESC_SIZE)
         self._apply_schedule_font_size()
         self._image_cache = {}
+        self._wrap_cache = {}
         self._program_canvas_items = {}
         self._schedule_grid_height = 0
         self._highlight_reset_job = None
@@ -1428,6 +1626,10 @@ class RecRApp:
         """番組の実際の放送開始・終了datetimeを求める（不正なデータならNone, None）"""
         return reservation_logic.program_air_window(program)
 
+    def _program_matches_reservation(self, station, program, reservation):
+        """番組表上のある番組が、指定の予約と同じ回かどうかを判定する"""
+        return reservation_logic.program_matches_reservation(station, program, reservation)
+
     def _find_now_airing_program(self, station):
         """指定局のキャッシュ済み番組表から、現在放送中の番組情報を探す（無ければNone）
 
@@ -1448,6 +1650,23 @@ class RecRApp:
         """指定局のキャッシュ済み番組表から、現在放送中の番組名を探す（無ければNone）"""
         program = self._find_now_airing_program(station)
         return (program.get('title') or None) if program else None
+
+    def _find_program_for_reservation(self, station, reservation):
+        """指定局のキャッシュ済み番組表から、指定の予約に対応する回の番組情報を探す（無ければNone）
+
+        予約録音の実行時（_check_due_reservations）専用。前後マージン設定により
+        録音開始が番組本来の開始時刻より早まっている場合、_find_now_airing_program
+        （現在時刻基準）では録音開始時点にまだ放送中の「前の番組」を誤って拾って
+        しまうため、必ず予約自体の対象回（局・開始時刻・放送日/曜日が一致する回）
+        を番組表から探して使う。
+        """
+        cached = self.manager.load_cached_schedule(station)
+        if not cached:
+            return None
+        for program in cached:
+            if self._program_matches_reservation(station, program, reservation):
+                return program
+        return None
 
     def _build_recording_metadata(self, station, program=None, fallback_title=None):
         """録音ファイルに埋め込むメタデータ（番組名・出演者・局名・概要・放送日）を組み立てる
@@ -1794,6 +2013,10 @@ class RecRApp:
                 )
             )
             self._reservation_row_map[item_id] = res.get('id')
+
+        # 予約の追加・変更・削除を、表示中の番組表の予約枠（囲み色）にも反映する
+        if hasattr(self, 'schedule_canvas') and self._current_programs:
+            self.display_schedule(self._current_programs, mode=self.schedule_mode_var.get())
 
     def _reservation_occurrence_program_dict(self, reservation):
         """予約の直近の回（1回のみならその日、毎週なら直近のその曜日の日）を、
@@ -2786,7 +3009,7 @@ class RecRApp:
                 mp3_bitrate = 192
 
             reservation_title = reservation.get('title')
-            program = self._find_now_airing_program(station)
+            program = self._find_program_for_reservation(station, reservation)
             success, output_path = self.manager.start_recording(
                 station, duration_minutes,
                 file_format=file_format, mp3_bitrate=mp3_bitrate,
@@ -3042,7 +3265,11 @@ class RecRApp:
             )
 
     def _refresh_stale_stations(self):
-        """起動時: 当日以降の情報が一定日数以下しかない局の番組表を自動更新する"""
+        """起動時: 当日以降の情報が一定日数以下しかない局の番組表を自動更新する
+
+        局数が多いと時間がかかるため、進捗ダイアログ（キャンセル可）を表示しつつ
+        複数局を並列でバックグラウンド取得する（詳細は _bulk_refresh_schedules と同様）。
+        """
         stale_stations = [
             s for s in self.manager.get_stations()
             if self.manager.count_cached_future_days(s) <= self.SCHEDULE_STALE_THRESHOLD_DAYS
@@ -3050,18 +3277,50 @@ class RecRApp:
         if not stale_stations:
             return
 
-        failed_stations = []
-        self._set_app_busy(True)
-        try:
-            for station in stale_stations:
-                try:
-                    _, success = self.fetch_and_cache_schedule(station)
+        dialog, progress_var, progressbar, cancel_event = self._open_schedule_fetch_progress_dialog(
+            "番組表の自動更新"
+        )
+        progressbar.configure(maximum=len(stale_stations))
+        progress_var.set(f"0/{len(stale_stations)}局 取得中...")
+
+        def worker():
+            failed_stations = []
+            any_created = False
+            completed = 0
+            lock = threading.Lock()
+
+            def fetch_one(station):
+                nonlocal completed, any_created
+                if cancel_event.is_set():
+                    return
+                success, created, error_label = self._fetch_and_cache_schedule_no_ui(station, cancel_event)
+                with lock:
                     if not success:
-                        failed_stations.append(station)
-                except Exception as e:
-                    failed_stations.append(f"{station}（{e}）")
-        finally:
-            self._set_app_busy(False)
+                        failed_stations.append(error_label)
+                    if created:
+                        any_created = True
+                    completed += 1
+                    n = completed
+                self.root.after(
+                    0, self._update_schedule_fetch_progress, progress_var, progressbar, n,
+                    len(stale_stations), station
+                )
+
+            with ThreadPoolExecutor(max_workers=self.SCHEDULE_STATION_FETCH_WORKERS) as executor:
+                list(executor.map(fetch_one, stale_stations))
+
+            self.root.after(0, self._on_stale_refresh_done, dialog, any_created, failed_stations)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_stale_refresh_done(self, dialog, any_created, failed_stations):
+        """起動時の自動番組表更新の完了処理（メインスレッドで実行）"""
+        dialog.grab_release()
+        dialog.destroy()
+
+        if any_created:
+            self._refresh_reservation_list()
+        self.load_schedule_for_current_station()
 
         if failed_stations:
             messagebox.showwarning(
@@ -3123,26 +3382,37 @@ class RecRApp:
         logger.info(f"全局番組表自動更新を開始します（{len(stations)}局）")
         failed_stations = []
         any_created = False
-        for station in stations:
+        lock = threading.Lock()
+
+        def fetch_one(station):
+            nonlocal any_created
             try:
                 programs = self.manager.get_program_schedule(station, days=self.SCHEDULE_FETCH_DAYS)
                 if not programs:
-                    failed_stations.append(station)
+                    with lock:
+                        failed_stations.append(station)
                 else:
                     self.manager.save_schedule_cache(station, programs)
                     if self.manager.scan_freewords_for_station(station, programs):
-                        any_created = True
+                        with lock:
+                            any_created = True
             except Exception as e:
-                failed_stations.append(f"{station}（{e}）")
+                with lock:
+                    failed_stations.append(f"{station}（{e}）")
 
             try:
                 timefree_programs = self.manager.get_timefree_schedule(station)
                 if not timefree_programs:
-                    failed_stations.append(f"{station}（タイムフリー）")
+                    with lock:
+                        failed_stations.append(f"{station}（タイムフリー）")
                 else:
                     self.manager.save_schedule_cache(f"{station}::timefree", timefree_programs)
             except Exception as e:
-                failed_stations.append(f"{station}（タイムフリー: {e}）")
+                with lock:
+                    failed_stations.append(f"{station}（タイムフリー: {e}）")
+
+        with ThreadPoolExecutor(max_workers=self.SCHEDULE_STATION_FETCH_WORKERS) as executor:
+            list(executor.map(fetch_one, stations))
 
         self.manager.prune_stale_schedule_cache()
         self.manager.save_settings({'last_full_schedule_refresh_date': today_iso})
@@ -3216,27 +3486,58 @@ class RecRApp:
     def _wrap_lines(self, text, tk_font, max_width, max_lines):
         """textを幅max_width・最大max_lines行に折り返す。
         収まりきらない場合は最終行の末尾を「…」に置き換える。
+
+        結果は(フォント, 文字サイズ設定, 幅, 最大行数, テキスト)単位でキャッシュする。
+        同じ局を再表示したりテーマ・タブを切り替えたりする際、番組の並びは
+        変わらないのに毎回全番組分を測り直すと描画が遅くなるため。
         """
         if not text or max_lines <= 0:
             return []
 
+        cache_key = (id(tk_font), self._schedule_font_size_key, max_width, max_lines, text)
+        cached = self._wrap_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        lines = self._wrap_lines_uncached(text, tk_font, max_width, max_lines)
+        self._wrap_cache[cache_key] = lines
+        return lines
+
+    def _wrap_lines_uncached(self, text, tk_font, max_width, max_lines):
         lines = []
         remaining = text
         for _ in range(max_lines):
             if not remaining:
                 break
-            n = 0
-            while n < len(remaining) and tk_font.measure(remaining[:n + 1]) <= max_width:
-                n += 1
-            n = max(n, 1)
+            if tk_font.measure(remaining) <= max_width:
+                n = len(remaining)
+            else:
+                # 何文字までなら幅に収まるかを二分探索で求める。measure()は
+                # Tclへの往復が発生し重いため、1文字ずつ測る線形探索だと
+                # 番組数が多い時に番組表の描画が目に見えて遅くなる
+                lo, hi = 1, len(remaining)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if tk_font.measure(remaining[:mid]) <= max_width:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                n = max(lo, 1)
             lines.append(remaining[:n])
             remaining = remaining[n:]
 
         if remaining:
             ellipsis = "…"
             last = lines[-1] if lines else ""
-            while last and tk_font.measure(last + ellipsis) > max_width:
-                last = last[:-1]
+            if last and tk_font.measure(last + ellipsis) > max_width:
+                lo, hi = 0, len(last)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if tk_font.measure(last[:mid] + ellipsis) <= max_width:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                last = last[:lo]
             lines[-1] = (last + ellipsis) if last else ellipsis
 
         return lines
@@ -3332,6 +3633,12 @@ class RecRApp:
         now = datetime.now()
         now_minutes = self._minutes_from_day_start(now.strftime("%H:%M"))
 
+        station = self.schedule_station_var.get()
+        station_reservations = [
+            res for res in self.manager.load_reservations()
+            if res.get('enabled', True) and res.get('station') == station
+        ]
+
         for col, (date_label, day_programs) in enumerate(days.items()):
             col_left = self.TIME_LABEL_WIDTH + col * self.DAY_COLUMN_WIDTH
             canvas.create_line(col_left, 0, col_left, grid_height, fill=colors['day_line'])
@@ -3380,8 +3687,18 @@ class RecRApp:
                     fill_color = colors['future_fill']
                     outline_color = colors['future_outline']
 
+                # 現在予約が入っている番組は枠を目立たせて一目で分かるようにする
+                # （タイムフリー表示中や、放送が終わった番組には付けない）
+                is_reserved = mode != 'timefree' and not is_past and any(
+                    self._program_matches_reservation(station, program, res)
+                    for res in station_reservations
+                )
+                outline_width = 2 if is_reserved else 1
+                if is_reserved:
+                    outline_color = colors['reserved_outline']
+
                 rect = canvas.create_rectangle(
-                    x1, y1, x2, y2, fill=fill_color, outline=outline_color
+                    x1, y1, x2, y2, fill=fill_color, outline=outline_color, width=outline_width
                 )
                 items = [rect]
 

@@ -39,6 +39,28 @@ def program_air_window(program):
     return start_dt, end_dt
 
 
+def program_matches_reservation(station, program, reservation):
+    """番組表上のある番組が、指定の予約と同じ回（同じ局・同じ開始時刻・同じ放送日/曜日）
+    かどうかを判定する（番組表の枠に予約済みを示す装飾を付けるために使う）
+    """
+    if not reservation.get('enabled', True):
+        return False
+    if reservation.get('station') != station:
+        return False
+    start = program.get('start')
+    if not start or reservation.get('start') != start:
+        return False
+
+    actual_date_iso = program_actual_date_iso(program.get('date_iso') or '', start)
+    if reservation.get('repeat') == 'weekly':
+        try:
+            weekday = datetime.strptime(actual_date_iso, "%Y-%m-%d").weekday()
+        except ValueError:
+            return False
+        return reservation.get('weekday') == weekday
+    return bool(actual_date_iso) and reservation.get('date_iso') == actual_date_iso
+
+
 def reservation_occurrence_program_dict(reservation, now=None):
     """予約の直近の回（1回のみならその日、毎週なら直近のその曜日の日）を、
     program_air_window 等が扱える「番組」風の辞書にして返す（計算できなければNone）
