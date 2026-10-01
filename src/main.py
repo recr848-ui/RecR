@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.app_logger import setup_logging
 from utils.radiko_manager import RadikoManager, keyword_matches
+from utils.radiru_manager import RadiruManager
 from utils import reservation_logic
 
 setup_logging()
@@ -92,6 +93,7 @@ class RecRApp:
         self.root.geometry("1450x800")
 
         self.manager = RadikoManager()
+        self.radiru_manager = RadiruManager()
         stations = self.manager.get_stations()
         settings = self.manager.load_settings()
 
@@ -143,6 +145,8 @@ class RecRApp:
         self._program_guide_refresh_job = None
         self._full_refresh_check_job = None
         self._full_refresh_in_progress = False
+        self._radiru_refresh_check_job = None
+        self._radiru_refresh_in_progress = False
         # 局名 -> {'title', 'start_dt', 'end_dt'}。手動・予約を問わず、現在進行中の
         # 全ての録音を右上のパネルに表示するための情報
         self._active_recordings = {}
@@ -162,6 +166,7 @@ class RecRApp:
         self._schedule_reservation_list_minute_refresh()
         self._schedule_program_guide_minute_refresh()
         self._check_full_schedule_refresh_due()
+        self._check_radiru_index_refresh_due()
         self.root.after(1500, self._notify_missed_reservations_on_startup)
         self._refresh_notice()
 
@@ -755,6 +760,10 @@ class RecRApp:
                 'unavailable_fill': '#4a2f2f',
                 'unavailable_outline': '#8a5a5a',
                 'reserved_outline': '#ff8c3f',
+                # NHK番組のタイムフリー表示時、NHK聴き逃しインデックスに
+                # 登録済み（ダウンロードできる見込みが高い）かどうかの区別用
+                'radiru_available_outline': '#4cc785',
+                'radiru_unavailable_outline': '#7a7a7a',
                 'title': '#eaeaea',
                 'title_link': '#78b3ff',
                 'desc': '#b5b5b5',
@@ -771,6 +780,8 @@ class RecRApp:
             'unavailable_fill': '#f7e6e6',
             'unavailable_outline': '#c98a8a',
             'reserved_outline': '#e2690a',
+            'radiru_available_outline': '#2e9e5b',
+            'radiru_unavailable_outline': '#999999',
             'title': '#222222',
             'title_link': '#1a5fb4',
             'desc': '#666666',
@@ -1614,6 +1625,22 @@ class RecRApp:
             )
         )
 
+    def _scroll_schedule_to_now(self):
+        """番組表（当日以降表示）を開いた直後、現在時刻が上寄りに見える位置まで
+        自動スクロールする。過去の時間帯まで毎回手動でスクロールしなくて済むように。
+
+        yview_moveto は表示領域全体に対する割合で指定するため、ウィンドウの
+        描画がまだ完了していない起動直後でも（winfo_height()が未確定でも）
+        正しく動く。
+        """
+        if not self._schedule_grid_height:
+            return
+        now_minutes = self._minutes_from_day_start(datetime.now().strftime("%H:%M"))
+        y_now = now_minutes * self.PIXELS_PER_MINUTE
+        margin = 20
+        target_frac = max(0.0, (y_now - margin) / self._schedule_grid_height)
+        self.schedule_canvas.yview_moveto(target_frac)
+
     def _program_actual_date_iso(self, date_iso, start_hhmm):
         """番組の date_iso（放送日、5:00始まり）と start（HH:MM）から、
         実際のカレンダー上の日付を求める（0-4時台の番組は翌カレンダー日になるため）
@@ -1798,6 +1825,15 @@ class RecRApp:
             )
             return
 
+        # NHKはradikoではライブ配信のみでタイムフリーを一切提供しておらず
+        # （取得自体は成功するが、内容が「配信しておりません」という案内音声に
+        # なる）、代わりにNHK独自の聴き逃し配信（らじる★らじる）を使う
+        if self._is_nhk_station(station):
+            self._open_nhk_radiru_download_dialog(
+                program, station, title, start_dt, end_dt, on_success
+            )
+            return
+
         if now - end_dt > timedelta(days=7):
             messagebox.showinfo(
                 "タイムフリー",
@@ -1896,6 +1932,133 @@ class RecRApp:
             if on_success is not None:
                 on_success()
 
+    @staticmethod
+    def _is_nhk_station(station):
+        """局名がNHK（NHK AM/NHK FM等、地域名付き表記を含む）かどうかを判定する"""
+        return station.startswith("NHK")
+
+    @staticmethod
+    def _nhk_radio_broadcast_code(station):
+        """局名からNHK聴き逃し側の放送区分コード（"FM" または "R1"）を求める"""
+        return "FM" if "FM" in station else "R1"
+
+    def _open_nhk_radiru_download_dialog(self, program, station, title, start_dt, end_dt, on_success):
+        """NHKの番組をダブルクリックした時: らじる★らじるの聴き逃し配信から取得する
+
+        radikoのタイムフリーはNHKに一切対応していない（ライブのみ）ため、NHKの
+        番組はこちらのルートに誘導する。聴き逃し側は番組名からの検索APIを
+        持たないため、定期的に蓄積しているローカルインデックス
+        （radiru_series_index.json）から番組名で引き当てる。インデックスに
+        無い場合や、その番組がそもそもNHKの聴き逃し対象外の場合は、その旨を
+        伝えて終了する。
+        """
+        radio_broadcast = self._nhk_radio_broadcast_code(station)
+        corner_name = program.get('corner_name') if isinstance(program, dict) else None
+
+        self._set_app_busy(True)
+        try:
+            entry = self.radiru_manager.find_series_for_program(radio_broadcast, title, corner_name)
+            if entry is None:
+                messagebox.showinfo(
+                    "NHK聴き逃し",
+                    f"「{title}」はNHK聴き逃し配信のインデックスにまだ登録されていないか、"
+                    "聴き逃し非対応の番組です。\n"
+                    "インデックスは定期的に自動更新されるため、時間をおいて再度お試しください。"
+                )
+                return
+
+            try:
+                episodes = self.radiru_manager.fetch_series_episodes(
+                    entry['series_site_id'], entry['corner_site_id']
+                )
+            except Exception:
+                logger.exception(f"NHK聴き逃しのエピソード一覧取得に失敗しました ({title})")
+                messagebox.showerror(
+                    "NHK聴き逃し", f"「{title}」のエピソード情報を取得できませんでした。\n通信状況をご確認ください。"
+                )
+                return
+
+            episode = self.radiru_manager.find_episode_for_date(episodes, start_dt)
+            if episode is None:
+                messagebox.showinfo(
+                    "NHK聴き逃し",
+                    f"「{title}」の{start_dt.strftime('%m/%d')}放送分は、NHK聴き逃し配信の"
+                    "対象外か、既に配信期限（放送から約1週間）を過ぎています。"
+                )
+                return
+
+            stream_url = episode.get('stream_url')
+            if not stream_url:
+                messagebox.showinfo("NHK聴き逃し", f"「{title}」の配信データを取得できませんでした。")
+                return
+
+            if not messagebox.askyesno(
+                "NHK聴き逃し", f"「{title}」（{start_dt.strftime('%m/%d')}放送）をNHK聴き逃し配信から"
+                "ダウンロードしますか？"
+            ):
+                return
+
+            filename = self.manager.build_recording_filename(
+                self.filename_pattern_var.get(), station, title, start_dt, "m4a"
+            )
+            output_path = self.manager.unique_output_path(self.manager.output_dir / filename)
+            metadata = self._build_recording_metadata(station, program=program, fallback_title=title)
+
+            ft = start_dt.strftime("%Y%m%d%H%M%S")
+            key = f"{station}|radiru|{ft}"
+            self._register_active_download(key, station, ft, title)
+
+            thread = threading.Thread(
+                target=self._nhk_radiru_download_worker,
+                args=(stream_url, output_path, metadata, key, station, title, on_success),
+                daemon=True,
+            )
+            thread.start()
+        finally:
+            self._set_app_busy(False)
+
+    def _nhk_radiru_download_worker(self, stream_url, output_path, metadata, key, station, title,
+                                     on_success):
+        """NHK聴き逃しのダウンロード本体（バックグラウンドスレッド）"""
+        error = None
+        try:
+            self.radiru_manager.download_episode(
+                stream_url, output_path,
+                on_progress=lambda done, total, k=key: self.root.after(
+                    0, self._update_active_download_progress, k, done, total
+                ),
+            )
+            self.manager.write_metadata_tags(output_path, "m4a", metadata)
+        except Exception as e:
+            logger.exception(f"NHK聴き逃しのダウンロードに失敗しました ({title})")
+            error = str(e)
+        self.root.after(
+            0, self._on_nhk_radiru_download_complete, key, station, title, output_path, error, on_success
+        )
+
+    def _on_nhk_radiru_download_complete(self, key, station, title, output_path, error, on_success):
+        """NHK聴き逃しのダウンロード終了時（メインスレッドから呼ばれる）"""
+        self._unregister_active_download(key)
+        if hasattr(self, 'files_tree'):
+            self._refresh_files_list()
+
+        had_data = output_path.exists() and output_path.stat().st_size > 0
+        if not had_data:
+            detail = f"\n（{error}）" if error else ""
+            message = (
+                f"{station} の「{title}」のNHK聴き逃し取得に失敗しました。\n"
+                f"通信状況をご確認ください。{detail}"
+            )
+            if self._tray_icon is not None:
+                self._notify_via_tray("NHK聴き逃し", message)
+            else:
+                messagebox.showwarning("NHK聴き逃し", message)
+        else:
+            if self._tray_icon is not None:
+                self._notify_via_tray("NHK聴き逃し", f"{station} の「{title}」の取得が完了しました。")
+            if on_success is not None:
+                on_success()
+
     def _sort_treeview_column(self, tree, col, reverse):
         """Treeviewの列見出しクリックで、その列の値に基づき行を並べ替える
         （再クリックで昇順・降順を反転）。
@@ -1978,7 +2141,7 @@ class RecRApp:
             else:
                 schedule_text = res.get('date_iso', '')
 
-            if self.manager.is_recording_active(res.get('station')):
+            if self.manager.is_recording_active(res.get('station'), reservation_id=res.get('id')):
                 status_text = "録音中"
             elif res.get('timefree_downloaded'):
                 status_text = "DL済"
@@ -3017,6 +3180,7 @@ class RecRApp:
                 metadata=self._build_recording_metadata(
                     station, program=program, fallback_title=reservation_title
                 ),
+                reservation_id=reservation['id'],
                 on_complete=lambda had_data, path, error, rid=reservation['id'], occ=occurrence_iso, st=station:
                     self.root.after(0, self._on_reservation_recording_complete, rid, occ, st, had_data, path, error)
             )
@@ -3138,27 +3302,23 @@ class RecRApp:
 
     def load_schedule_for_current_station(self):
         """選択中のステーションの番組表を表示する。
-        キャッシュがあればそれを表示、なければ取得を確認するダイアログを出す
+        キャッシュがあればそれを表示、なければ取得しないと表示しようがないので
+        確認なしでそのまま取得する
         """
         station = self.schedule_station_var.get()
         cached = self.manager.load_cached_schedule(station)
         if cached:
             self.display_schedule(cached)
+            self._scroll_schedule_to_now()
             return
 
-        if messagebox.askyesno(
-            "番組表",
-            f"{station} の番組表のキャッシュがありません。今すぐ取得しますか？"
-        ):
-            self._set_app_busy(True)
-            try:
-                programs, _ = self.fetch_and_cache_schedule(station)
-            finally:
-                self._set_app_busy(False)
-            self.display_schedule(programs)
-        else:
-            # 前のステーションの番組表が残らないようクリア
-            self.display_schedule([])
+        self._set_app_busy(True)
+        try:
+            programs, _ = self.fetch_and_cache_schedule(station)
+        finally:
+            self._set_app_busy(False)
+        self.display_schedule(programs)
+        self._scroll_schedule_to_now()
 
     def _has_programs_in_timefree_window(self, programs):
         """programsの中に、タイムフリー対象期間（当日を含む過去7日間）に入っている
@@ -3180,7 +3340,8 @@ class RecRApp:
 
     def load_timefree_schedule_for_current_station(self):
         """選択中のステーションのタイムフリー対象期間（過去7日間）の番組表を表示する。
-        キャッシュがあればそれを表示、なければ取得を確認するダイアログを出す
+        キャッシュがあればそれを表示、なければ取得しないと表示しようがないので
+        確認なしでそのまま取得する
 
         通常の番組表キャッシュ（局名のみをキーにする）と衝突しないよう、
         "{局名}::timefree" というキーで別名空間に保存・取得
@@ -3193,19 +3354,13 @@ class RecRApp:
             self.display_schedule(cached, mode='timefree')
             return
 
-        if messagebox.askyesno(
-            "タイムフリー",
-            f"{station} の過去7日間の番組表のキャッシュがありません。今すぐ取得しますか？"
-        ):
-            self._set_app_busy(True)
-            try:
-                programs = self.manager.get_timefree_schedule(station)
-                self.manager.save_schedule_cache(cache_key, programs)
-            finally:
-                self._set_app_busy(False)
-            self.display_schedule(programs, mode='timefree')
-        else:
-            self.display_schedule([], mode='timefree')
+        self._set_app_busy(True)
+        try:
+            programs = self.manager.get_timefree_schedule(station)
+            self.manager.save_schedule_cache(cache_key, programs)
+        finally:
+            self._set_app_busy(False)
+        self.display_schedule(programs, mode='timefree')
 
     def fetch_and_cache_schedule(self, station):
         """番組表を取得してキャッシュに保存する
@@ -3258,6 +3413,7 @@ class RecRApp:
         finally:
             self._set_app_busy(False)
         self.display_schedule(programs)
+        self._scroll_schedule_to_now()
         if not success:
             messagebox.showwarning(
                 "番組表の取得",
@@ -3357,6 +3513,50 @@ class RecRApp:
         self._full_refresh_check_job = self.root.after(
             self.FULL_SCHEDULE_REFRESH_CHECK_INTERVAL_MS, self._check_full_schedule_refresh_due
         )
+
+    def _check_radiru_index_refresh_due(self):
+        """NHK聴き逃し（らじる★らじる）の番組インデックス更新が必要かを定期的にチェックする
+
+        全局番組表自動更新と違い「1日1回、特定時刻を過ぎたら」ではなく、
+        new_arrivalsが特定の時刻に紐づく情報ではないため「前回取得から
+        RadiruManager.INDEX_REFRESH_INTERVAL_HOURS時間経過したら」で判定する。
+        アプリを起動していなかった間の分は、次に起動した直後のチェックで
+        即座に取得される。
+        """
+        last_iso = self.manager.load_settings().get('last_radiru_index_fetch')
+        due = True
+        if last_iso:
+            try:
+                last_dt = datetime.fromisoformat(last_iso)
+                due = (datetime.now() - last_dt) >= timedelta(
+                    hours=RadiruManager.INDEX_REFRESH_INTERVAL_HOURS
+                )
+            except ValueError:
+                due = True
+
+        if due and not self._radiru_refresh_in_progress:
+            self._start_radiru_index_refresh()
+
+        self._radiru_refresh_check_job = self.root.after(
+            self.FULL_SCHEDULE_REFRESH_CHECK_INTERVAL_MS, self._check_radiru_index_refresh_due
+        )
+
+    def _start_radiru_index_refresh(self):
+        """NHK聴き逃しの新着番組インデックスをバックグラウンドスレッドで更新する"""
+        self._radiru_refresh_in_progress = True
+        thread = threading.Thread(target=self._radiru_index_refresh_worker, daemon=True)
+        thread.start()
+
+    def _radiru_index_refresh_worker(self):
+        try:
+            self.radiru_manager.update_index()
+            self.manager.save_settings({
+                'last_radiru_index_fetch': datetime.now().isoformat(timespec="seconds")
+            })
+        except Exception:
+            logger.exception("NHK聴き逃しインデックスの更新に失敗しました")
+        finally:
+            self._radiru_refresh_in_progress = False
 
     def _start_full_schedule_refresh(self):
         """全局の番組表をバックグラウンドスレッドで取得し直す（UIは一切ブロックしない）"""
@@ -3634,6 +3834,13 @@ class RecRApp:
         now_minutes = self._minutes_from_day_start(now.strftime("%H:%M"))
 
         station = self.schedule_station_var.get()
+        # NHK局のタイムフリー表示中のみ、番組ごとにNHK聴き逃しインデックスとの
+        # 突き合わせを行う（radikoは他局と同じくタイムフリーで取得できるため
+        # 対象外）。インデックスは番組の数だけ読み直さないよう、ここで1回だけ
+        # 読み込んでおく
+        show_radiru_availability = mode == 'timefree' and self._is_nhk_station(station)
+        radiru_index = self.radiru_manager.load_index() if show_radiru_availability else None
+        radiru_broadcast_code = self._nhk_radio_broadcast_code(station) if show_radiru_availability else None
         station_reservations = [
             res for res in self.manager.load_reservations()
             if res.get('enabled', True) and res.get('station') == station
@@ -3696,6 +3903,23 @@ class RecRApp:
                 outline_width = 2 if is_reserved else 1
                 if is_reserved:
                     outline_color = colors['reserved_outline']
+
+                # NHK局のタイムフリー表示: NHK聴き逃しインデックスに番組名が
+                # 登録済みなら「ダウンロードできる見込みが高い」、未登録なら
+                # 「非対応か、まだインデックスに載っていない」として枠線で区別する。
+                # 対象日のエピソードが実際に配信中かまでは番組表の描画時点では
+                # 確認していない（番組の数だけネットワーク問い合わせが必要になり
+                # 重くなるため）ので、あくまで目安の表示
+                if show_radiru_availability and not not_yet_aired:
+                    available = self.radiru_manager.find_series_for_program(
+                        radiru_broadcast_code, program.get('title') or '', program.get('corner_name'),
+                        index=radiru_index,
+                    ) is not None
+                    outline_color = (
+                        colors['radiru_available_outline'] if available
+                        else colors['radiru_unavailable_outline']
+                    )
+                    outline_width = 2 if available else 1
 
                 rect = canvas.create_rectangle(
                     x1, y1, x2, y2, fill=fill_color, outline=outline_color, width=outline_width
@@ -3916,7 +4140,7 @@ class RecRApp:
     def _register_active_download(self, key, station, ft, title):
         """右上パネルに表示する「タイムフリー取得中」の情報を登録する"""
         self._active_downloads[key] = {
-            'station': station, 'ft': ft, 'title': title, 'done': 0, 'total': None,
+            'key': key, 'station': station, 'ft': ft, 'title': title, 'done': 0, 'total': None,
             'start_dt': datetime.now(),
         }
         self._refresh_active_recordings_panel()
@@ -3943,7 +4167,8 @@ class RecRApp:
             self._refresh_active_recordings_panel()
 
     def _format_download_progress_text(self, entry):
-        base = f"⬇ {entry['station']}「{entry['title']}」 タイムフリー取得中..."
+        label = "NHK聴き逃し" if "|radiru|" in entry.get('key', '') else "タイムフリー"
+        base = f"⬇ {entry['station']}「{entry['title']}」 {label}取得中..."
         done, total = entry['done'], entry['total']
         if not total:
             return base
@@ -4038,7 +4263,7 @@ class RecRApp:
             return
         stations = {
             r.get('station') for r in reservations
-            if self.manager.is_recording_active(r.get('station'))
+            if self.manager.is_recording_active(r.get('station'), reservation_id=r.get('id'))
         }
         if not stations:
             messagebox.showinfo("予約録音", "選択した予約の中に、現在録音中のものはありません。")

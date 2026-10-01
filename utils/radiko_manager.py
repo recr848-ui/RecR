@@ -177,6 +177,12 @@ class RadikoManager:
         # メモリキャッシュを返す（更新はmtimeで検知）
         self._schedule_cache_mem = None
         self._schedule_cache_mtime = None
+        # 複数局を並列取得する際（起動時のstale局チェック・全局自動更新）、
+        # 各ワーカースレッドが save_schedule_cache で「読む→1局分だけ書き換える
+        # →全体を書き戻す」を行うため、ロックなしだと他スレッドの書き込みを
+        # 読み落として上書きし、その局のキャッシュが丸ごと消えてしまうことがある
+        # （実際に発生を確認済み）。読み込み～書き戻しの区間をロックで直列化する
+        self._schedule_cache_lock = threading.Lock()
         self.image_cache_dir = self.cache_dir / "images"
         self.settings_file = self.cache_dir / "settings.json"
         self.reservations_file = self.cache_dir / "reservations.json"
@@ -314,13 +320,19 @@ class RadikoManager:
         return entry.get("programs")
 
     def save_schedule_cache(self, station_name, programs):
-        """ステーションの番組表をキャッシュに保存"""
-        cache = self._load_cache_file()
-        cache[station_name] = {
-            "fetched_at": datetime.now().isoformat(timespec="seconds"),
-            "programs": programs
-        }
-        self._save_cache_file(cache)
+        """ステーションの番組表をキャッシュに保存
+
+        複数局を並列取得中は他スレッドも同時にこのメソッドを呼ぶため、
+        「読み込み→1局分書き換え→書き戻し」の区間はロックで直列化する
+        （でないと他スレッドの更新を読み落として上書きしてしまう）。
+        """
+        with self._schedule_cache_lock:
+            cache = self._load_cache_file()
+            cache[station_name] = {
+                "fetched_at": datetime.now().isoformat(timespec="seconds"),
+                "programs": programs
+            }
+            self._save_cache_file(cache)
 
     def count_cached_future_days(self, station_name):
         """キャッシュのうち当日以降の日数を数える（キャッシュがなければ0）
@@ -349,19 +361,20 @@ class RadikoManager:
         Returns:
             list: 削除したキーの一覧
         """
-        cache = self._load_cache_file()
-        current_stations = set(self.station_mapping.keys())
+        with self._schedule_cache_lock:
+            cache = self._load_cache_file()
+            current_stations = set(self.station_mapping.keys())
 
-        removed = []
-        for key in list(cache.keys()):
-            station_name = key[:-len("::timefree")] if key.endswith("::timefree") else key
-            if station_name not in current_stations:
-                removed.append(key)
-                del cache[key]
+            removed = []
+            for key in list(cache.keys()):
+                station_name = key[:-len("::timefree")] if key.endswith("::timefree") else key
+                if station_name not in current_stations:
+                    removed.append(key)
+                    del cache[key]
 
-        if removed:
-            self._save_cache_file(cache)
-            logger.info(f"番組表キャッシュの孤立エントリを削除しました: {', '.join(removed)}")
+            if removed:
+                self._save_cache_file(cache)
+                logger.info(f"番組表キャッシュの孤立エントリを削除しました: {', '.join(removed)}")
 
         return removed
 
@@ -1407,8 +1420,16 @@ class RadikoManager:
                 return candidate
             counter += 1
 
+    def build_recording_filename(self, filename_pattern, station, title, dt, ext):
+        """_build_recording_filenameの公開ラッパー（radiko以外の取得元でも同じ命名規則を使うため）"""
+        return self._build_recording_filename(filename_pattern, station, title, dt, ext)
+
+    def unique_output_path(self, path):
+        """_unique_output_pathの公開ラッパー"""
+        return self._unique_output_path(path)
+
     def start_recording(self, station, duration, file_format="aac", mp3_bitrate=192, on_complete=None,
-                         title=None, filename_pattern=None, metadata=None):
+                         title=None, filename_pattern=None, metadata=None, reservation_id=None):
         """ラジコストリームの録音を開始する（局が異なれば複数を同時に録音できる）
 
         Args:
@@ -1431,6 +1452,9 @@ class RadikoManager:
                 'title'（番組名）, 'artist'（出演者）, 'album'（局名）,
                 'comment'（番組概要）, 'date'（放送日 "YYYY-MM-DD"）のいずれかを
                 含む辞書。未指定のキーは書き込まない
+            reservation_id (str または None): 予約録音から呼ばれた場合の予約ID。
+                is_recording_active(station, reservation_id=...) で、どの予約が
+                実際に録音中かを区別するために使う。手動録音の場合はNone
 
         Returns:
             (bool, str または None): (録音開始に成功したか, 保存先ファイルパス文字列)
@@ -1483,7 +1507,8 @@ class RadikoManager:
         )
         with self._recordings_lock:
             self._recordings[station] = {
-                'thread': thread, 'stop_event': stop_event, 'output_path': output_path
+                'thread': thread, 'stop_event': stop_event, 'output_path': output_path,
+                'reservation_id': reservation_id,
             }
         thread.start()
         logger.info(f"録音開始: {station} ({duration}分, {file_format}) -> {output_path}")
@@ -1718,6 +1743,10 @@ class RadikoManager:
 
         tags.save(output_path, v2_version=3)
 
+    def write_metadata_tags(self, output_path, file_format, metadata):
+        """_write_metadata_tagsの公開ラッパー（radiko以外の取得元でも同じタグ付けを使うため）"""
+        return self._write_metadata_tags(output_path, file_format, metadata)
+
     def _recording_worker(self, segment_iter, stop_event,
                            output_path, file_format, mp3_bitrate, duration_seconds, station,
                            on_complete=None, metadata=None, registry=None, registry_lock=None,
@@ -1872,17 +1901,24 @@ class RadikoManager:
                 except Exception:
                     logger.exception("Error in recording on_complete callback")
 
-    def is_recording_active(self, station=None):
+    def is_recording_active(self, station=None, reservation_id=None):
         """録音中かどうか
 
         Args:
             station (str または None): 指定した局が録音中かを調べる。
                 Noneの場合はいずれかの局が録音中であればTrue
+            reservation_id (str または None): 指定した場合、その局で録音中なのが
+                この予約IDによるものかどうかまで区別する。局が同じでも別の予約
+                （や手動録音）による録音であればFalseを返す
         """
         with self._recordings_lock:
             if station is not None:
                 entry = self._recordings.get(station)
-                return bool(entry and entry['thread'].is_alive())
+                if not entry or not entry['thread'].is_alive():
+                    return False
+                if reservation_id is not None:
+                    return entry.get('reservation_id') == reservation_id
+                return True
             return any(entry['thread'].is_alive() for entry in self._recordings.values())
 
     def stop_recording(self, station=None):

@@ -400,16 +400,13 @@ def test_timefree_schedule_refetches_when_cache_is_entirely_out_of_window(app, m
     }]
     monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda st: fresh_programs)
 
-    asked = {}
-    def fake_askyesno(*a, **k):
-        asked['called'] = True
-        return True
-    monkeypatch.setattr(messagebox, "askyesno", fake_askyesno)
+    def fail_if_called(*a, **k):
+        raise AssertionError("取得しないと表示できないのに確認ダイアログを出した")
+    monkeypatch.setattr(messagebox, "askyesno", fail_if_called)
 
     app.schedule_station_var.set(station)
     app.load_timefree_schedule_for_current_station()
 
-    assert asked.get('called'), "古いキャッシュのまま再取得を促さなかった"
     assert app._current_programs == fresh_programs
 
 
