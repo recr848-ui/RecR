@@ -22,6 +22,24 @@ def program_actual_date_iso(date_iso, start_hhmm):
     return target_date.strftime("%Y-%m-%d")
 
 
+def _broadcast_date_iso(actual_date_iso, start_hhmm):
+    """program_actual_date_iso の逆変換: 実カレンダー上の日付と start（HH:MM）から、
+    番組表の date_iso（放送日、5:00始まり）を求める（0-4時台は前日の放送日に属する）
+
+    予約の date_iso / weekday は実カレンダー上の日付・曜日で保存されているため、
+    予約を「番組」風の辞書にする際はこれで放送日に戻す。戻さないと
+    program_air_window が0-4時台をもう一度翌日へ繰り上げてしまう。
+    """
+    try:
+        target_date = datetime.strptime(actual_date_iso, "%Y-%m-%d").date()
+        hour = int(start_hhmm.split(":")[0])
+    except (ValueError, AttributeError, IndexError):
+        return actual_date_iso
+    if hour < 5:
+        target_date -= timedelta(days=1)
+    return target_date.strftime("%Y-%m-%d")
+
+
 def program_air_window(program):
     """番組の実際の放送開始・終了datetimeを求める（不正なデータなら (None, None)）"""
     date_iso = program.get('date_iso') or datetime.now().strftime("%Y-%m-%d")
@@ -79,9 +97,10 @@ def reservation_occurrence_program_dict(reservation, now=None):
         date_iso = reservation.get('date_iso')
         if not date_iso:
             return None
+    start = reservation.get('start') or '00:00'
     return {
-        'date_iso': date_iso,
-        'start': reservation.get('start') or '00:00',
+        'date_iso': _broadcast_date_iso(date_iso, start),
+        'start': start,
         'end': reservation.get('end') or '00:00',
         'title': reservation.get('title') or '',
     }

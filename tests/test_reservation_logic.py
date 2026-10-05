@@ -86,6 +86,42 @@ def test_occurrence_dict_for_weekly_reservation_without_weekday_is_none():
     assert rl.reservation_occurrence_program_dict(reservation) is None
 
 
+# --- 予約の直近の回 -> 放送時間帯（0-4時台） --------------------------------------
+# 予約の date_iso / weekday は実カレンダー上の日付・曜日で保存されている
+# （番組表から予約する際に program_actual_date_iso で変換済み）。そのため、
+# 予約から求めた放送時間帯が0-4時台でもさらに翌日へずれてはいけない。
+
+def test_occurrence_air_window_for_once_late_night_reservation_keeps_its_date():
+    reservation = {
+        "repeat": "once", "date_iso": "2026-09-11",
+        "start": "02:30", "end": "03:00", "title": "ラジオ深夜便",
+    }
+    occurrence = rl.reservation_occurrence_program_dict(reservation)
+    start_dt, end_dt = rl.program_air_window(occurrence)
+    assert start_dt == datetime(2026, 9, 11, 2, 30)
+    assert end_dt == datetime(2026, 9, 11, 3, 0)
+
+
+def test_occurrence_air_window_for_weekly_late_night_reservation_keeps_its_weekday():
+    # 2026-09-10は木曜(weekday=3)。木曜1:00の直近の回は当日2026-09-10の1:00。
+    now = datetime(2026, 9, 10, 12, 0)
+    reservation = {"repeat": "weekly", "weekday": 3, "start": "01:00", "end": "02:00"}
+    occurrence = rl.reservation_occurrence_program_dict(reservation, now=now)
+    start_dt, end_dt = rl.program_air_window(occurrence)
+    assert start_dt == datetime(2026, 9, 10, 1, 0)
+    assert end_dt == datetime(2026, 9, 10, 2, 0)
+
+
+def test_occurrence_air_window_for_once_daytime_reservation_is_unchanged():
+    reservation = {
+        "repeat": "once", "date_iso": "2026-09-11", "start": "23:00", "end": "01:00",
+    }
+    occurrence = rl.reservation_occurrence_program_dict(reservation)
+    start_dt, end_dt = rl.program_air_window(occurrence)
+    assert start_dt == datetime(2026, 9, 11, 23, 0)
+    assert end_dt == datetime(2026, 9, 12, 1, 0)
+
+
 # --- reservation_is_overdue_pending --------------------------------------------
 
 def _not_recording(station):
@@ -130,6 +166,16 @@ def test_overdue_pending_false_when_currently_recording():
         "start": "09:00", "end": "10:00",
     }
     assert rl.reservation_is_overdue_pending(reservation, _always_recording, now=now) is False
+
+
+def test_overdue_pending_true_for_late_night_reservation_on_the_same_day():
+    # 2026-09-11の2:30-3:00の予約は、同日の昼には終了時刻を過ぎている
+    now = datetime(2026, 9, 11, 12, 0)
+    reservation = {
+        "repeat": "once", "station": "NHK-FM", "date_iso": "2026-09-11",
+        "start": "02:30", "end": "03:00",
+    }
+    assert rl.reservation_is_overdue_pending(reservation, _not_recording, now=now) is True
 
 
 # --- reservation_needs_timefree_recovery ---------------------------------------
