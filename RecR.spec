@@ -11,7 +11,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 未使用の大きな依存を除外してexeサイズを抑える:
+    # numpy(レベル計算は純Python化済み)、PillowのAVIF対応とフォント描画(どちらも未使用)
+    excludes=['numpy', 'PIL._avif', 'PIL.AvifImagePlugin', 'PIL._imagingft'],
     noarchive=False,
     optimize=0,
 )

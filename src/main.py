@@ -1263,8 +1263,15 @@ class RecRApp:
 
         # ステータスラベル
         self.status_var = tk.StringVar(value="準備完了")
-        status_label = ttk.Label(left_frame, textvariable=self.status_var)
+        status_label = ttk.Label(left_frame, textvariable=self.status_var, justify=tk.CENTER)
         status_label.pack(pady=10)
+        # 録音中は保存先のフルパスを含む長い文になるため、左カラムの幅で折り返す
+        # （折り返さないとラベル幅に引っ張られて左カラムが広がり、お知らせ欄が狭くなる）
+        left_frame.bind(
+            "<Configure>",
+            lambda e: status_label.configure(wraplength=max(e.width - 20, 100)),
+            add="+"
+        )
 
         self._setup_notice_panel(content_frame)
 

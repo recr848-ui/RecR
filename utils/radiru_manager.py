@@ -4,15 +4,18 @@ NHKの番組はradikoのタイムフリーでは配信されない（ライブ�
 NHK独自の聴き逃し配信（らじる★らじる）から番組を探して録音するために使う。
 
 聴き逃し側は「番組名→内部ID」を引ける検索APIを持たないため、新着一覧
-（new_arrivals）を定期的に取得してローカルにインデックスとして蓄積し、
-番組名から引けるようにしておく方式を取っている。
+（new_arrivals）と50音別の番組一覧（series?kana=）を定期的に取得して
+ローカルにインデックスとして蓄積し、番組名から引けるようにしておく方式を
+取っている。
 """
 
 import json
 import logging
 import re
 import threading
+import unicodedata
 from datetime import datetime
+from functools import lru_cache
 
 import av
 import requests
@@ -29,7 +32,23 @@ _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/96.0",
 }
 
+# 50音別の番組一覧（series?kana=）で指定できる行。聴き逃し対象の全番組を
+# 列挙でき、new_arrivalsの直近200件から漏れた番組もここから拾える
+_KANA_ROWS = ("a", "k", "s", "t", "n", "h", "m", "y", "r", "w")
+
 _ONAIR_DATE_PATTERN = re.compile(r"(\d{1,2})月(\d{1,2})日")
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+@lru_cache(maxsize=4096)
+def _normalize_title(text):
+    """番組名の照合用に表記ゆれを吸収する
+
+    radikoの番組表は全角英数・全角記号（「ＮＨＫのど自慢」「マイあさ！」）、
+    NHK聴き逃し側は半角（「NHKのど自慢」）と表記が揃っていないため、NFKCで
+    寄せたうえで空白を除去して比較する。
+    """
+    return _WHITESPACE_PATTERN.sub("", unicodedata.normalize("NFKC", text or "")).lower()
 
 
 class RadiruManager:
@@ -97,8 +116,24 @@ class RadiruManager:
         r.raise_for_status()
         return r.json().get("corners", [])
 
+    def fetch_series_list(self):
+        """聴き逃し対象の番組一覧を50音の全行ぶん取得する
+
+        new_arrivalsと同じ形（series_site_id/corner_site_id/title等）の要素を返す。
+        一部の行の取得に失敗しても、取得できた行のぶんは返す。
+        """
+        series = []
+        for row in _KANA_ROWS:
+            try:
+                r = requests.get(SERIES_URL, params={"kana": row}, headers=_HEADERS, timeout=15)
+                r.raise_for_status()
+                series.extend(r.json().get("series", []))
+            except (requests.RequestException, ValueError):
+                logger.warning(f"NHK聴き逃しの番組一覧取得に失敗しました (kana={row})", exc_info=True)
+        return series
+
     def update_index(self):
-        """new_arrivalsを取得し、ローカルインデックスへ差分マージする
+        """new_arrivalsと番組一覧を取得し、ローカルインデックスへ差分マージする
 
         series_site_id/corner_site_idは番組（コーナー）ごとに不変なため、
         一度観測した番組は以後new_arrivalsに出てこなくても引き続き使える。
@@ -106,7 +141,7 @@ class RadiruManager:
         Returns:
             int: 新規または変更されたエントリ数
         """
-        corners = self.fetch_new_arrivals()
+        corners = self.fetch_new_arrivals() + self.fetch_series_list()
         now_iso = datetime.now().isoformat(timespec="seconds")
         changed = 0
         with self._index_lock:
@@ -150,8 +185,15 @@ class RadiruManager:
     def find_series_for_program(self, radio_broadcast, title, corner_name=None, index=None):
         """番組名からインデックス済みのseries_site_id/corner_site_idを探す
 
-        完全一致が無ければコーナー名なしでの一致、それも無ければ番組名の
-        部分一致（曜日つきタイトル等の表記ゆれ対策）にフォールバックする。
+        radikoの番組表のタイトルは「歌謡スクランブル　選▽市川昭介作品集」の
+        ように回ごとの副題が付くため、インデックス側の番組名（「歌謡スクランブル」）
+        が番組表のタイトルに含まれているかで照合する。複数の番組名が該当する
+        場合は最も長い（＝最も具体的な）ものを採る。
+
+        同じ番組に複数のコーナーがある場合（「マイあさ！」の「健康ライフ」等）は、
+        コーナー名もタイトルに含まれているものを優先し、無ければコーナー名なしの
+        番組本体を返す。どのコーナーか決められない場合は、別コーナーの音声を
+        取得してしまわないようNoneを返す。
 
         index（dict または None）: 事前にload_index()で読み込んだインデックス。
         省略時はこのメソッド内でファイルから読み込む。
@@ -162,20 +204,34 @@ class RadiruManager:
         if index is None:
             index = self._load_index_file()
 
-        key = self._index_key(radio_broadcast, title, corner_name)
-        entry = index.get(key)
-        if entry:
-            return entry
-
-        key_no_corner = self._index_key(radio_broadcast, title, "")
-        entry = index.get(key_no_corner)
-        if entry:
-            return entry
-
+        haystack = _normalize_title(title) + _normalize_title(corner_name)
+        candidates = []
+        best_len = 0
         for entry in index.values():
-            if entry.get("radio_broadcast") == radio_broadcast and title in entry.get("title", ""):
+            # 両波で放送される番組は radio_broadcast が "R1,FM" のように入る
+            if radio_broadcast not in entry.get("radio_broadcast", "").split(","):
+                continue
+            entry_title = _normalize_title(entry.get("title"))
+            if not entry_title or entry_title not in haystack:
+                continue
+            if len(entry_title) > best_len:
+                best_len = len(entry_title)
+                candidates = [entry]
+            elif len(entry_title) == best_len:
+                candidates.append(entry)
+        if not candidates:
+            return None
+
+        with_corner = [
+            (len(corner), entry) for entry in candidates
+            if (corner := _normalize_title(entry.get("corner_name"))) and corner in haystack
+        ]
+        if with_corner:
+            return max(with_corner, key=lambda pair: pair[0])[1]
+        for entry in candidates:
+            if not _normalize_title(entry.get("corner_name")):
                 return entry
-        return None
+        return candidates[0] if len(candidates) == 1 else None
 
     # ---- エピソード検索・ダウンロード ----
 

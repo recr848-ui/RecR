@@ -8,17 +8,18 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import queue
 import re
 import threading
 import time
+from array import array
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-import numpy as np
 import requests
 from xml.etree import ElementTree as ET
 
@@ -39,6 +40,60 @@ def keyword_matches(keyword, haystack):
     return all(term in haystack for term in terms)
 
 
+# PCMはs16・ステレオ・インターリーブのバイト列で扱う（1フレーム = 2ch x 2バイト）
+_PCM_BYTES_PER_FRAME = 4
+
+
+def _frame_to_pcm(frame):
+    """リサンプル済みのPyAVフレーム(s16, stereo)をPCMバイト列に変換する。
+
+    planeのバッファにはアライメント用の余白が付く場合があるため、
+    実サンプル数ぶんだけ切り出す。
+    """
+    return bytes(frame.planes[0])[:frame.samples * _PCM_BYTES_PER_FRAME]
+
+
+_fft_cache = {}
+
+
+def _fft_tables(n):
+    """長さn(2のべき乗)のFFT用にビット反転順とひねり係数をキャッシュして返す"""
+    tables = _fft_cache.get(n)
+    if tables is None:
+        bits = n.bit_length() - 1
+        rev = [int(format(i, f"0{bits}b")[::-1], 2) for i in range(n)]
+        twiddles = [complex(math.cos(-2 * math.pi * k / n), math.sin(-2 * math.pi * k / n))
+                    for k in range(n // 2)]
+        window = [0.5 - 0.5 * math.cos(2 * math.pi * k / (n - 1)) for k in range(n)]
+        tables = (rev, twiddles, window)
+        _fft_cache[n] = tables
+    return tables
+
+
+def _spectrum_magnitudes(samples):
+    """実数列(長さは2のべき乗)にハン窓をかけた振幅スペクトル(n//2+1点)を返す。
+
+    numpyに依存しないよう、反復型の基数2 FFTで計算する。
+    """
+    n = len(samples)
+    rev, twiddles, window = _fft_tables(n)
+    data = [complex(samples[r] * window[r]) for r in rev]
+    size = 2
+    while size <= n:
+        half = size // 2
+        step = n // size
+        for start in range(0, n, size):
+            for k in range(half):
+                i = start + k
+                j = i + half
+                t = twiddles[k * step] * data[j]
+                u = data[i]
+                data[i] = u + t
+                data[j] = u - t
+        size *= 2
+    return [abs(c) for c in data[:n // 2 + 1]]
+
+
 class _LiveAudioBuffer:
     """ライブ再生用の音声チャンク(PCM)を貯めておく簡易バッファ。
 
@@ -55,9 +110,9 @@ class _LiveAudioBuffer:
         self._finished = False
 
     def push(self, pcm):
-        """PCMチャンク(shape=(フレーム数, 2))をバッファに追加する"""
+        """PCMチャンク(s16ステレオのバイト列)をバッファに追加する"""
         with self._lock:
-            self._buffered_samples += pcm.shape[0]
+            self._buffered_samples += len(pcm) // _PCM_BYTES_PER_FRAME
         self._queue.put(pcm)
 
     def mark_finished(self):
@@ -86,7 +141,7 @@ class _LiveAudioBuffer:
         pcm = self._queue.get(timeout=timeout)
         if pcm is not None:
             with self._lock:
-                self._buffered_samples -= pcm.shape[0]
+                self._buffered_samples -= len(pcm) // _PCM_BYTES_PER_FRAME
         return pcm
 
 
@@ -143,6 +198,7 @@ class RadikoManager:
         self._levels_lock = threading.Lock()
         self._levels = [0.0] * self.EQ_NUM_BANDS
         self._lr_levels = [0.0, 0.0]
+        self._levels_updated_at = 0.0
 
         self.output_dir = Path.home() / "Music" / "RecR"
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1241,8 +1297,7 @@ class RadikoManager:
                         for resampled in resampler.resample(frame):
                             if stop_event.is_set():
                                 break
-                            pcm = resampled.to_ndarray()
-                            buffer.push(pcm.reshape(-1, 2))
+                            buffer.push(_frame_to_pcm(resampled))
                 finally:
                     container.close()
         except Exception:
@@ -1279,7 +1334,7 @@ class RadikoManager:
                 if pcm is None:
                     break
                 if stream_handle is None:
-                    stream_handle = sd.OutputStream(
+                    stream_handle = sd.RawOutputStream(
                         samplerate=buffer.sample_rate, channels=2, dtype="int16"
                     )
                     stream_handle.start()
@@ -1301,44 +1356,57 @@ class RadikoManager:
                 self._levels = [0.0] * self.EQ_NUM_BANDS
                 self._lr_levels = [0.0, 0.0]
 
+    # グラフィックイコライザーの描画間隔(50ms)より細かく計算しても表示されないため、
+    # レベル計算はこの間隔に間引く（純PythonのFFTでCPUを食いすぎないようにする）
+    LEVELS_UPDATE_INTERVAL = 0.04
+
     def _update_levels(self, pcm, sample_rate):
-        """デコード済みPCM(int16, shape=(-1,2))からグラフィックイコライザー用の
+        """デコード済みPCM(s16ステレオのバイト列)からグラフィックイコライザー用の
         周波数バンド別レベル(0.0〜1.0)を計算し保持する
         """
-        if pcm.size == 0:
+        now = time.monotonic()
+        if now - self._levels_updated_at < self.LEVELS_UPDATE_INTERVAL:
             return
 
-        # PyAVのto_ndarray()はインターリーブされた1行の配列 (1, N) で返るため、
-        # 再生時と同様に (フレーム数, チャンネル数) へreshapeしてから処理する
-        stereo = pcm.reshape(-1, 2).astype(np.float32) / 32768.0
-        mono = stereo.mean(axis=1)
-        n = len(mono)
-        if n < 2:
+        samples = array("h")
+        samples.frombytes(pcm[:len(pcm) - len(pcm) % _PCM_BYTES_PER_FRAME])
+        left = samples[0::2]
+        right = samples[1::2]
+        frames = len(left)
+        if frames < 2:
             return
+        self._levels_updated_at = now
 
         lr_levels = []
-        for ch in range(2):
-            peak = np.max(np.abs(stereo[:, ch]))
-            db = 20 * np.log10(peak + 1e-6)
+        for channel in (left, right):
+            peak = max(max(channel), -min(channel)) / 32768.0
+            db = 20 * math.log10(peak + 1e-6)
             # ピークメーターらしく0dBFS（フルスケール）を基準に、
             # -24dB〜0dBFSを0.0〜1.0へ正規化する
-            lr_levels.append(float(np.clip((db + 24) / 24, 0.0, 1.0)))
+            lr_levels.append(min(max((db + 24) / 24, 0.0), 1.0))
 
-        spectrum = np.abs(np.fft.rfft(mono * np.hanning(n)))
-        freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+        # FFTは2のべき乗長で行うため、収まる最大の長さに切り詰める
+        n = 1 << (frames.bit_length() - 1)
+        mono = [(left[i] + right[i]) / 65536.0 for i in range(n)]
+        spectrum = _spectrum_magnitudes(mono)
+        bin_width = sample_rate / n
 
         max_freq = min(16000, sample_rate / 2 - 1)
-        band_edges = np.logspace(np.log10(60), np.log10(max_freq), self.EQ_NUM_BANDS + 1)
+        log_lo = math.log10(60)
+        log_step = (math.log10(max_freq) - log_lo) / self.EQ_NUM_BANDS
+        band_edges = [10 ** (log_lo + log_step * i) for i in range(self.EQ_NUM_BANDS + 1)]
 
         levels = []
         for i in range(self.EQ_NUM_BANDS):
-            mask = (freqs >= band_edges[i]) & (freqs < band_edges[i + 1])
-            magnitude = spectrum[mask].mean() if np.any(mask) else 0.0
-            db = 20 * np.log10(magnitude + 1e-6)
+            lo = math.ceil(band_edges[i] / bin_width)
+            hi = math.ceil(band_edges[i + 1] / bin_width)
+            band = spectrum[lo:hi]
+            magnitude = sum(band) / len(band) if band else 0.0
+            db = 20 * math.log10(magnitude + 1e-6)
             # 実測でおおよそ -20dB〜+35dBに収まるため、それを 0.0〜1.0 に正規化
             # （絶対的な音量ではなく見た目のためのスケーリング）
             level = (db + 20) / 55
-            levels.append(float(np.clip(level, 0.0, 1.0)))
+            levels.append(min(max(level, 0.0), 1.0))
 
         with self._levels_lock:
             self._levels = levels
@@ -1815,7 +1883,7 @@ class RadikoManager:
                             )
                         for frame in container.decode(audio_stream):
                             for resampled in resampler.resample(frame):
-                                self._update_levels(resampled.to_ndarray(), audio_stream.rate)
+                                self._update_levels(_frame_to_pcm(resampled), audio_stream.rate)
                     elif file_format == "m4a":
                         if output_stream is None:
                             output_stream = output_container.add_stream_from_template(audio_stream)
@@ -1829,7 +1897,7 @@ class RadikoManager:
                             duration = packet.duration or 0
                             for frame in packet.decode():
                                 for resampled in resampler.resample(frame):
-                                    self._update_levels(resampled.to_ndarray(), audio_stream.rate)
+                                    self._update_levels(_frame_to_pcm(resampled), audio_stream.rate)
                             had_data = True
                             packet.pts = pts_counter
                             packet.dts = pts_counter
@@ -1850,7 +1918,7 @@ class RadikoManager:
                         for frame in container.decode(audio_stream):
                             for resampled in resampler.resample(frame):
                                 had_data = True
-                                self._update_levels(resampled.to_ndarray(), audio_stream.rate)
+                                self._update_levels(_frame_to_pcm(resampled), audio_stream.rate)
                                 resampled.pts = pts_counter
                                 pts_counter += resampled.samples
                                 for packet in output_stream.encode(resampled):
