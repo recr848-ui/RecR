@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import calendar
 import ctypes
+import hashlib
 import io
 import json
 import logging
@@ -39,6 +40,7 @@ _URL_PATTERN = re.compile(r'https?://[^\s"\'<>]+')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.app_logger import setup_logging
+from utils.paths import get_base_dir
 from utils.radiko_manager import RadikoManager, keyword_matches
 from utils.radiru_manager import RadiruManager
 from utils import reservation_logic
@@ -52,6 +54,8 @@ class RecRApp:
     PIXELS_PER_MINUTE = 2.0
     DAY_COLUMN_WIDTH = 130
     TIME_LABEL_WIDTH = 55
+    SCHEDULE_PROGRAM_TAG = "program"
+    SCHEDULE_LINK_TAG = "program_link"
     DAY_HEADER_HEIGHT = 28
 
     # 番組表の文字サイズ設定（小/中/大）。「小」を基準に、文字サイズ設定に応じて
@@ -81,6 +85,12 @@ class RecRApp:
 
     # 検索結果クリック時のハイライト表示時間
     HIGHLIGHT_DURATION_MS = 8000
+
+    # メモリ内キャッシュの上限件数（長期間起動しっぱなしでも際限なく増えないようにする）。
+    # 折り返し結果は全局・両表示モードを一巡して約4000件（数MB）、
+    # 番組画像(100x100のPhotoImage)は1枚あたり約33KB
+    WRAP_CACHE_MAX_ENTRIES = 8000
+    IMAGE_CACHE_MAX_ENTRIES = 200
 
     # 「録音」タブ右側のお知らせ欄に表示するMarkdownファイルの取得元。
     # NOTICE.mdをmasterブランチにpushすると、次回起動時（または「更新」ボタン）で反映される
@@ -158,6 +168,10 @@ class RecRApp:
         self._tray_icon = None
         self._tray_hint_shown = settings.get('tray_hint_shown', False)
         self._sleep_prevented = False
+        # (予約ID, 対象日) -> {'attempts': 連続して再開に失敗した回数, 'had_data': これまでに
+        # 一部でも録音できたか}。開始失敗・途中中断した予約録音を番組終了まで再開し続ける
+        # ための状態（_schedule_reservation_resume）
+        self._reservation_resume_state = {}
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_button)
         self._refresh_stale_stations()
@@ -1454,6 +1468,32 @@ class RecRApp:
             lambda e: self.schedule_canvas.yview_scroll(int(-e.delta / 120), "units")
         )
 
+        # 番組枠のイベントは、アイテムごとではなく共有タグに対して一度だけ
+        # バインドする。アイテムごとにtag_bindすると、毎分の再描画のたびに
+        # Tclコマンドが登録され続け（canvas.delete では解放されない）、
+        # 長時間起動でMemoryErrorになるため
+        self._schedule_item_programs = {}
+        self._schedule_item_urls = {}
+        self._schedule_display_mode = 'upcoming'
+        self.schedule_canvas.tag_bind(self.SCHEDULE_PROGRAM_TAG, "<Enter>", self._on_schedule_item_enter)
+        self.schedule_canvas.tag_bind(
+            self.SCHEDULE_PROGRAM_TAG, "<Leave>", lambda e: self._hide_tooltip()
+        )
+        self.schedule_canvas.tag_bind(
+            self.SCHEDULE_PROGRAM_TAG, "<Double-Button-1>", self._on_schedule_item_double_click
+        )
+        self.schedule_canvas.tag_bind(
+            self.SCHEDULE_LINK_TAG, "<Button-1>", self._on_schedule_link_click
+        )
+        self.schedule_canvas.tag_bind(
+            self.SCHEDULE_LINK_TAG, "<Enter>",
+            lambda e: self.schedule_canvas.config(cursor="hand2"), add="+"
+        )
+        self.schedule_canvas.tag_bind(
+            self.SCHEDULE_LINK_TAG, "<Leave>",
+            lambda e: self.schedule_canvas.config(cursor=""), add="+"
+        )
+
         self._tooltip = None
         self.schedule_title_font = tkfont.Font(family="Yu Gothic UI", size=self.SCHEDULE_BASE_TITLE_SIZE)
         self.schedule_title_link_font = tkfont.Font(
@@ -1985,7 +2025,7 @@ class RecRApp:
                 )
                 return
 
-            episode = self.radiru_manager.find_episode_for_date(episodes, start_dt)
+            episode = self.radiru_manager.find_episode_for_date(episodes, start_dt, end_dt)
             if episode is None:
                 messagebox.showinfo(
                     "NHK聴き逃し",
@@ -2049,8 +2089,10 @@ class RecRApp:
         if hasattr(self, 'files_tree'):
             self._refresh_files_list()
 
+        # 途中で失敗した場合も冒頭だけのファイルが残るため、ファイルの有無
+        # だけで成功扱いにせず、エラーがあれば失敗として知らせる
         had_data = output_path.exists() and output_path.stat().st_size > 0
-        if not had_data:
+        if error or not had_data:
             detail = f"\n（{error}）" if error else ""
             message = (
                 f"{station} の「{title}」のNHK聴き逃し取得に失敗しました。\n"
@@ -2070,11 +2112,47 @@ class RecRApp:
         """Treeviewの列見出しクリックで、その列の値に基づき行を並べ替える
         （再クリックで昇順・降順を反転）。
         """
+        self._apply_treeview_sort(tree, col, reverse)
+        # 一覧を作り直した後も同じ並びを再現できるよう、最後のソート条件を覚えておく
+        tree._sort_state = (col, reverse)
+        tree.heading(col, command=lambda: self._sort_treeview_column(tree, col, not reverse))
+
+    def _apply_treeview_sort(self, tree, col, reverse):
+        """Treeviewの行を、指定列の値で並べ替える"""
         items = [(tree.set(item, col), item) for item in tree.get_children("")]
         items.sort(key=lambda pair: pair[0], reverse=reverse)
         for index, (_, item) in enumerate(items):
             tree.move(item, "", index)
-        tree.heading(col, command=lambda: self._sort_treeview_column(tree, col, not reverse))
+
+    def _capture_treeview_view(self, tree, row_map):
+        """一覧を作り直す前に、選択行・フォーカス行・スクロール位置を控えておく
+
+        行のIDは作り直すたびに変わるため、row_map（行ID→データのキー）を使って
+        データ側のキーで覚える。
+        """
+        return {
+            'selected': {row_map[item] for item in tree.selection() if item in row_map},
+            'focus': row_map.get(tree.focus()),
+            'yview': tree.yview()[0],
+        }
+
+    def _restore_treeview_view(self, tree, row_map, view):
+        """一覧の作り直し後に、ユーザーが最後に選んだソート条件を掛け直し、
+        _capture_treeview_view で控えた選択行・フォーカス行・スクロール位置を戻す
+        """
+        sort_state = getattr(tree, "_sort_state", None)
+        if sort_state is not None:
+            self._apply_treeview_sort(tree, *sort_state)
+
+        selected = [item for item, key in row_map.items() if key in view['selected']]
+        if selected:
+            tree.selection_set(selected)
+        if view['focus'] is not None:
+            for item, key in row_map.items():
+                if key == view['focus']:
+                    tree.focus(item)
+                    break
+        tree.yview_moveto(view['yview'])
 
     def setup_reservation_tab(self, parent):
         """「予約録音」タブのUIをセットアップ（予約の一覧・追加・編集・削除）"""
@@ -2138,6 +2216,7 @@ class RecRApp:
     def _refresh_reservation_list(self):
         """予約録音の一覧表示をマネージャー側の最新データで作り直す"""
         tree = self.reservation_tree
+        view = self._capture_treeview_view(tree, self._reservation_row_map)
         tree.delete(*tree.get_children())
         self._reservation_row_map = {}
 
@@ -2183,6 +2262,7 @@ class RecRApp:
                 )
             )
             self._reservation_row_map[item_id] = res.get('id')
+        self._restore_treeview_view(tree, self._reservation_row_map, view)
 
         # 予約の追加・変更・削除を、表示中の番組表の予約枠（囲み色）にも反映する
         if hasattr(self, 'schedule_canvas') and self._current_programs:
@@ -2465,6 +2545,7 @@ class RecRApp:
     def _refresh_freeword_list(self):
         """フリーワードの一覧表示をマネージャー側の最新データで作り直す"""
         tree = self.freeword_tree
+        view = self._capture_treeview_view(tree, self._freeword_row_map)
         tree.delete(*tree.get_children())
         self._freeword_row_map = {}
 
@@ -2478,6 +2559,7 @@ class RecRApp:
                 )
             )
             self._freeword_row_map[item_id] = fw.get('id')
+        self._restore_treeview_view(tree, self._freeword_row_map, view)
 
     def _get_selected_freewords(self):
         """フリーワード一覧で選択中の行に対応するデータを全て取得する（未選択なら空リスト）"""
@@ -2592,6 +2674,7 @@ class RecRApp:
     def _refresh_files_list(self):
         """保存先フォルダ内の音声ファイル一覧を作り直す（音声ファイルのみ表示）"""
         tree = self.files_tree
+        view = self._capture_treeview_view(tree, self._files_row_map)
         tree.delete(*tree.get_children())
         self._files_row_map = {}
 
@@ -2613,6 +2696,7 @@ class RecRApp:
             size_text = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB"
             item_id = tree.insert("", tk.END, values=(f.name, modified, size_text))
             self._files_row_map[item_id] = f
+        self._restore_treeview_view(tree, self._files_row_map, view)
 
     def _get_selected_files(self):
         """ファイル一覧で選択中の行に対応するパスを全て取得する（未選択なら空リスト）"""
@@ -3077,6 +3161,16 @@ class RecRApp:
         dialog.lift()
         dialog.focus_force()
 
+    # 予約録音の開始時刻が来ていないかを巡回する間隔（ミリ秒）
+    RESERVATION_CHECK_INTERVAL_MS = 15000
+    # 開始失敗・途中中断した予約録音を再開する際の待ち時間（秒）。最初はこの秒数で、
+    # 失敗が続くたびに倍にして上限で頭打ちにする（通信断が長引いている間、
+    # radiko側へ認証要求を送り続けないようにするため）
+    RESERVATION_RESUME_RETRY_SECONDS = 15
+    RESERVATION_RESUME_RETRY_MAX_SECONDS = 300
+    # 番組の残りがこの秒数を切っていたら、もう再開は試みない
+    RESERVATION_RESUME_MIN_REMAINING_SECONDS = 30
+
     def _schedule_reservation_check(self):
         """予約録音の開始時刻が来ていないか一定間隔でチェックする
 
@@ -3089,7 +3183,9 @@ class RecRApp:
             self._update_sleep_prevention()
         except Exception:
             logger.exception("予約チェック処理でエラーが発生しました")
-        self._reservation_check_job = self.root.after(15000, self._schedule_reservation_check)
+        self._reservation_check_job = self.root.after(
+            self.RESERVATION_CHECK_INTERVAL_MS, self._schedule_reservation_check
+        )
 
     def _on_prevent_sleep_changed(self):
         """設定メニューの「自動スリープを抑止する」チェック切り替え時の保存処理"""
@@ -3171,44 +3267,122 @@ class RecRApp:
                 # 他の予約や手動録音でその局が使用中。マークせず次回の巡回で再試行する
                 continue
 
-            duration_minutes = max(1, math.ceil((end_dt - datetime.now()).total_seconds() / 60))
-            file_format = self.format_var.get()
-            try:
-                mp3_bitrate = int(self.bitrate_var.get())
-            except ValueError:
-                mp3_bitrate = 192
-
-            reservation_title = reservation.get('title')
-            program = self._find_program_for_reservation(station, reservation)
-            success, output_path = self.manager.start_recording(
-                station, duration_minutes,
-                file_format=file_format, mp3_bitrate=mp3_bitrate,
-                title=reservation_title, filename_pattern=self.filename_pattern_var.get(),
-                metadata=self._build_recording_metadata(
-                    station, program=program, fallback_title=reservation_title
-                ),
-                reservation_id=reservation['id'],
-                on_complete=lambda had_data, path, error, rid=reservation['id'], occ=occurrence_iso, st=station:
-                    self.root.after(0, self._on_reservation_recording_complete, rid, occ, st, had_data, path, error)
-            )
-            if not success:
-                self.manager.mark_reservation_run(reservation['id'], occurrence_iso, result='failed')
             started_any = True
+            if self._start_reservation_recording(reservation, end_dt, occurrence_iso):
+                continue
 
-            if success:
-                self._register_active_recording(
-                    station, reservation.get('title') or station, duration_minutes
+            # 開始に失敗した（開始時刻ちょうどの瞬断・認証エラー等）。ここで諦めると
+            # その回は丸ごと録れないため、実行済みとして記録したうえで、番組終了まで
+            # 再開を試み続ける
+            self.manager.mark_reservation_run(reservation['id'], occurrence_iso, result='failed')
+            key = (reservation['id'], occurrence_iso)
+            self._reservation_resume_state[key] = {'attempts': 0, 'had_data': False}
+            if self._schedule_reservation_resume(reservation['id'], occurrence_iso, end_dt):
+                message = (
+                    f"{station} の予約録音を開始できませんでした。\n"
+                    "番組が終わるまで再試行を続けます。通信状況をご確認ください。"
                 )
-                self._watch_background_recording(station)
             else:
-                messagebox.showwarning(
-                    "予約録音", f"{station} の予約録音を開始できませんでした。\n通信状況をご確認ください。"
-                )
+                self._reservation_resume_state.pop(key, None)
+                message = f"{station} の予約録音を開始できませんでした。\n通信状況をご確認ください。"
+            if self._tray_icon is not None:
+                self._notify_via_tray("予約録音", message)
+            else:
+                # ここで直接ダイアログを出すと、閉じられるまでこの巡回処理から戻れず、
+                # 次回の巡回が予約されない（＝以降の予約録音が始まらない）ため、後回しにする
+                self.root.after(0, messagebox.showwarning, "予約録音", message)
 
         if started_any:
             self._refresh_reservation_list()
 
-    def _on_reservation_recording_complete(self, reservation_id, occurrence_iso, station, had_data, output_path, error):
+    def _start_reservation_recording(self, reservation, end_dt, occurrence_iso):
+        """予約 reservation の録音を、今から end_dt までの長さで開始する
+
+        予約の開始時刻が来たとき（_check_due_reservations）と、開始失敗・途中中断の後に
+        残りを録り直すとき（_resume_reservation_recording）の両方から呼ばれる。
+
+        Returns:
+            bool: 録音を開始できたか
+        """
+        station = reservation.get('station')
+        duration_minutes = max(1, math.ceil((end_dt - datetime.now()).total_seconds() / 60))
+        file_format = self.format_var.get()
+        try:
+            mp3_bitrate = int(self.bitrate_var.get())
+        except ValueError:
+            mp3_bitrate = 192
+
+        reservation_title = reservation.get('title')
+        program = self._find_program_for_reservation(station, reservation)
+        success, output_path = self.manager.start_recording(
+            station, duration_minutes,
+            file_format=file_format, mp3_bitrate=mp3_bitrate,
+            title=reservation_title, filename_pattern=self.filename_pattern_var.get(),
+            metadata=self._build_recording_metadata(
+                station, program=program, fallback_title=reservation_title
+            ),
+            reservation_id=reservation['id'],
+            on_complete=lambda had_data, path, error, rid=reservation['id'], occ=occurrence_iso, st=station:
+                self.root.after(
+                    0, self._on_reservation_recording_complete, rid, occ, st, had_data, path, error, end_dt
+                )
+        )
+        if success:
+            self._register_active_recording(station, reservation_title or station, duration_minutes)
+            self._watch_background_recording(station)
+        return success
+
+    def _schedule_reservation_resume(self, reservation_id, occurrence_iso, end_dt):
+        """開始失敗・途中中断した予約録音の再開を、少し待ってから試みるよう予約する
+
+        Returns:
+            bool: 再開を予約したか（番組の残り時間がほとんど無ければFalse）
+        """
+        key = (reservation_id, occurrence_iso)
+        state = self._reservation_resume_state.setdefault(key, {'attempts': 0, 'had_data': False})
+        delay = min(
+            self.RESERVATION_RESUME_RETRY_SECONDS * (2 ** state['attempts']),
+            self.RESERVATION_RESUME_RETRY_MAX_SECONDS,
+        )
+        remaining = (end_dt - datetime.now()).total_seconds()
+        if remaining - delay < self.RESERVATION_RESUME_MIN_REMAINING_SECONDS:
+            return False
+        state['attempts'] += 1
+        self.root.after(
+            int(delay * 1000), self._resume_reservation_recording, reservation_id, occurrence_iso, end_dt
+        )
+        return True
+
+    def _resume_reservation_recording(self, reservation_id, occurrence_iso, end_dt):
+        """開始失敗・途中中断した予約録音の残りを、新しいファイルに録音し直す
+
+        開始できなければ（通信がまだ復旧していない、同じ局を別の録音が使っている等）、
+        番組が終わるまで _schedule_reservation_resume で繰り返し試みる。
+        """
+        key = (reservation_id, occurrence_iso)
+        reservation = self.manager.get_reservation(reservation_id)
+        if reservation is None or not reservation.get('enabled', True):
+            # 待っている間に予約が削除・無効化された
+            self._reservation_resume_state.pop(key, None)
+            return
+
+        station = reservation.get('station')
+        started = False
+        try:
+            if not self.manager.is_recording_active(station):
+                started = self._start_reservation_recording(reservation, end_dt, occurrence_iso)
+        except Exception:
+            logger.exception(f"予約録音の再開処理でエラーが発生しました: {station}")
+
+        if started:
+            logger.info(f"予約録音を再開しました: {station}")
+            self._refresh_reservation_list()
+        elif not self._schedule_reservation_resume(reservation_id, occurrence_iso, end_dt):
+            logger.warning(f"予約録音を再開できないまま番組が終了しました: {station}")
+            self._reservation_resume_state.pop(key, None)
+
+    def _on_reservation_recording_complete(self, reservation_id, occurrence_iso, station, had_data, output_path,
+                                           error, end_dt=None):
         """予約録音のバックグラウンドスレッド終了時（メインスレッドから呼ばれる）:
         実際にデータを取得できたかに基づいて予約の実行結果を記録する。
 
@@ -3216,39 +3390,66 @@ class RecRApp:
         セグメントを1つも受信できなかった場合でも見た目上は「開始成功」になってしまう
         （出力ファイルが0バイトのまま）。この結果を録音終了後に上書きすることで、
         予約一覧の状態表示（成功/失敗）が実態と一致するようにする。
+
+        通信エラーで中断された場合、番組の残り時間（end_dt まで）があれば、残りを
+        別のファイルに録音し直す（_schedule_reservation_resume）。一度でも中断が
+        あった回は、最後まで録れても欠落があるため「成功」ではなく「中断」と記録する。
         """
-        if not had_data:
-            result = 'failed'
-        elif error:
-            result = 'partial'
+        key = (reservation_id, occurrence_iso)
+        state = self._reservation_resume_state.get(key)
+        interrupted_before = state is not None
+        any_data = had_data or (interrupted_before and state['had_data'])
+
+        will_resume = False
+        if error and end_dt is not None:
+            state = self._reservation_resume_state.setdefault(key, {'attempts': 0, 'had_data': False})
+            if had_data:
+                # 録音できていた＝通信は一度復旧していたので、待ち時間を最初からやり直す
+                state['attempts'] = 0
+                state['had_data'] = True
+            will_resume = self._schedule_reservation_resume(reservation_id, occurrence_iso, end_dt)
+        if not will_resume:
+            self._reservation_resume_state.pop(key, None)
+
+        if error or interrupted_before:
+            result = 'partial' if any_data else 'failed'
         else:
-            result = 'success'
+            result = 'success' if had_data else 'failed'
         self.manager.mark_reservation_run(reservation_id, occurrence_iso, result=result)
         self._refresh_reservation_list()
         if hasattr(self, 'files_tree'):
             self._refresh_files_list()
+
         if not had_data:
+            if interrupted_before:
+                # 再開を試みたが今回も取得できなかった。最初の中断・開始失敗の時点で
+                # 既に知らせているため、試行のたびに通知を繰り返さない
+                return
             detail = f"\n（{error}）" if error else ""
+            retry_note = "\n番組が終わるまで再試行を続けます。" if will_resume else ""
             message = (
                 f"{station} の予約録音でデータを取得できませんでした（ファイルが空です）。\n"
-                f"通信状況をご確認ください。{detail}"
+                f"通信状況をご確認ください。{retry_note}{detail}"
             )
-            if self._tray_icon is not None:
-                self._notify_via_tray("予約録音", message)
-            else:
-                messagebox.showwarning("予約録音", message)
         elif error:
+            resume_note = (
+                "通信が復旧しだい、残りを別のファイルに録音します。\n" if will_resume else ""
+            )
             message = (
                 f"{station} の予約録音は途中で通信エラーが発生し、中断されました。\n"
-                f"それまでの内容は保存されています。\n"
+                f"それまでの内容は保存されています。\n{resume_note}"
                 f"保存先: {output_path}\n（{error}）"
             )
+        else:
             if self._tray_icon is not None:
-                self._notify_via_tray("予約録音", message)
-            else:
-                messagebox.showwarning("予約録音", message)
-        elif self._tray_icon is not None:
-            self._notify_via_tray("予約録音", f"{station} の予約録音が完了しました。")
+                note = "（途中で中断があったため、ファイルが分かれています）" if interrupted_before else ""
+                self._notify_via_tray("予約録音", f"{station} の予約録音が完了しました。{note}")
+            return
+
+        if self._tray_icon is not None:
+            self._notify_via_tray("予約録音", message)
+        else:
+            messagebox.showwarning("予約録音", message)
 
     def _on_manual_recording_complete(self, station, had_data, output_path, error):
         """手動録音（録音タブ・番組表からの「今すぐ録音」）終了時（メインスレッドから呼ばれる）:
@@ -3622,6 +3823,7 @@ class RecRApp:
             list(executor.map(fetch_one, stations))
 
         self.manager.prune_stale_schedule_cache()
+        self.manager.prune_image_cache()
         self.manager.save_settings({'last_full_schedule_refresh_date': today_iso})
         logger.info(
             f"全局番組表自動更新が完了しました（失敗{len(failed_stations)}件）"
@@ -3707,6 +3909,10 @@ class RecRApp:
             return cached
 
         lines = self._wrap_lines_uncached(text, tk_font, max_width, max_lines)
+        # 番組表は日々入れ替わるため、長期間起動しっぱなしだと際限なく増える。
+        # 上限に達したら丸ごと捨てる（直後の再描画1回分だけ測り直しになる）
+        if len(self._wrap_cache) >= self.WRAP_CACHE_MAX_ENTRIES:
+            self._wrap_cache.clear()
         self._wrap_cache[cache_key] = lines
         return lines
 
@@ -3773,6 +3979,9 @@ class RecRApp:
         for widget in self.day_header_frame.winfo_children():
             widget.destroy()
         self._program_canvas_items = {}
+        self._schedule_item_programs = {}
+        self._schedule_item_urls = {}
+        self._schedule_display_mode = mode
 
         today_iso = datetime.now().strftime("%Y-%m-%d")
         if mode == 'timefree':
@@ -3970,18 +4179,8 @@ class RecRApp:
                     )
                     items.append(title_item)
                     if program_url:
-                        canvas.tag_bind(
-                            title_item, "<Button-1>",
-                            lambda e, u=program_url: webbrowser.open(u)
-                        )
-                        canvas.tag_bind(
-                            title_item, "<Enter>",
-                            lambda e: canvas.config(cursor="hand2"), add="+"
-                        )
-                        canvas.tag_bind(
-                            title_item, "<Leave>",
-                            lambda e: canvas.config(cursor=""), add="+"
-                        )
+                        canvas.addtag_withtag(self.SCHEDULE_LINK_TAG, title_item)
+                        self._schedule_item_urls[title_item] = program_url
                     text_y += used_height + 2
 
                 if desc_lines:
@@ -3996,26 +4195,35 @@ class RecRApp:
                     items.append(desc_item)
 
                 for item in items:
-                    canvas.tag_bind(
-                        item, "<Enter>",
-                        lambda e, p=program: self._show_tooltip(e, p), add="+"
-                    )
-                    canvas.tag_bind(
-                        item, "<Leave>", lambda e: self._hide_tooltip(), add="+"
-                    )
-                    if mode == 'timefree':
-                        canvas.tag_bind(
-                            item, "<Double-Button-1>",
-                            lambda e, p=program: self._open_timefree_download_dialog(p), add="+"
-                        )
-                    else:
-                        canvas.tag_bind(
-                            item, "<Double-Button-1>",
-                            lambda e, p=program: self._open_reservation_dialog_from_program(p), add="+"
-                        )
+                    canvas.addtag_withtag(self.SCHEDULE_PROGRAM_TAG, item)
+                    self._schedule_item_programs[item] = program
 
         right_edge = self.TIME_LABEL_WIDTH + num_cols * self.DAY_COLUMN_WIDTH
         canvas.create_line(right_edge, 0, right_edge, grid_height, fill=colors['day_line'])
+
+    def _schedule_item_under_pointer(self):
+        """番組表キャンバス上で、いまマウスポインタの下にあるアイテムIDを返す（無ければNone）"""
+        current = self.schedule_canvas.find_withtag("current")
+        return current[0] if current else None
+
+    def _on_schedule_item_enter(self, event):
+        program = self._schedule_item_programs.get(self._schedule_item_under_pointer())
+        if program is not None:
+            self._show_tooltip(event, program)
+
+    def _on_schedule_item_double_click(self, event):
+        program = self._schedule_item_programs.get(self._schedule_item_under_pointer())
+        if program is None:
+            return
+        if self._schedule_display_mode == 'timefree':
+            self._open_timefree_download_dialog(program)
+        else:
+            self._open_reservation_dialog_from_program(program)
+
+    def _on_schedule_link_click(self, event):
+        url = self._schedule_item_urls.get(self._schedule_item_under_pointer())
+        if url:
+            webbrowser.open(url)
 
     def _get_program_image(self, url):
         """番組画像をPhotoImageとして取得する（メモリ内キャッシュ＋マネージャー側のディスクキャッシュを利用）"""
@@ -4035,6 +4243,10 @@ class RecRApp:
                 logger.exception(f"Error decoding image {url}")
                 photo = None
 
+        # 長期間起動しっぱなしで際限なく増えないよう、古いものから捨てる
+        # （表示中のツールチップはラベル側が参照を保持しているので消えない）
+        while len(self._image_cache) >= self.IMAGE_CACHE_MAX_ENTRIES:
+            del self._image_cache[next(iter(self._image_cache))]
         self._image_cache[url] = photo
         return photo
 
@@ -4438,8 +4650,91 @@ class RecRApp:
             self.eq_canvas.coords(self._eq_peak_rects[i], x0, peak_y0, x1, peak_y1)
 
 
+_ERROR_ALREADY_EXISTS = 183
+# 多重起動防止用ミューテックスのハンドル。プロセスが生きている間ずっと保持し続ける
+# 必要があるため、モジュール変数に入れておく（閉じると他の起動を検知できなくなる）
+_single_instance_mutex = None
+
+
+def _acquire_single_instance_lock():
+    """このRecR（同じ場所に置かれたもの）が既に起動していないかを確認する
+
+    多重起動すると、同じ予約を両方が録音して重複ファイルができるうえ、設定・予約
+    ファイルを互いに上書きし合ってしまう。Windowsの名前付きミューテックスは
+    プロセスが強制終了しても自動的に解放されるため、ロックファイル方式と違い
+    「異常終了後に起動できなくなる」ことがない。
+
+    Returns:
+        bool: 起動してよければTrue、既に起動中ならFalse
+    """
+    global _single_instance_mutex
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
+        return True
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    # 設定・予約は実行ファイルの置き場所ごとに独立しているため、置き場所ごとに判定する
+    digest = hashlib.md5(str(get_base_dir()).lower().encode("utf-8")).hexdigest()
+    handle = kernel32.CreateMutexW(None, False, f"RecR_SingleInstance_{digest}")
+    if not handle:
+        # 判定できない場合は、起動できなくなるよりは起動を優先する
+        logger.warning("多重起動の確認に失敗しました（確認なしで起動します）")
+        return True
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    _single_instance_mutex = handle
+    return True
+
+
+def _install_exception_logging(root):
+    """どこにも捕捉されなかった例外をログファイルに記録するようにする
+
+    既定ではこれらは標準エラー出力に書かれるだけで、コンソールを持たない配布版
+    （PyInstallerのwindowedビルド）では誰にも見えないまま消えてしまう。長期間
+    起動しっぱなしで「いつの間にか動かなくなった」ときに原因を追えるようにする。
+    """
+    def log_tk_exception(exc_type, exc_value, exc_tb):
+        logger.error(
+            "画面の処理中に予期しないエラーが発生しました", exc_info=(exc_type, exc_value, exc_tb)
+        )
+
+    def log_thread_exception(args):
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread is not None else "不明"
+        logger.error(
+            f"スレッド（{name}）で予期しないエラーが発生しました",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    def log_uncaught_exception(exc_type, exc_value, exc_tb):
+        logger.critical(
+            "予期しないエラーでアプリが終了します", exc_info=(exc_type, exc_value, exc_tb)
+        )
+
+    root.report_callback_exception = log_tk_exception
+    threading.excepthook = log_thread_exception
+    sys.excepthook = log_uncaught_exception
+
+
 def main():
+    if not _acquire_single_instance_lock():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "RecR",
+            "RecRは既に起動しています。\n"
+            "ウィンドウが見当たらない場合は、タスクトレイのアイコンから表示できます。"
+        )
+        root.destroy()
+        return
+
     root = tk.Tk()
+    _install_exception_logging(root)
     app = RecRApp(root)
     root.mainloop()
 

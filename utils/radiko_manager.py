@@ -23,6 +23,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 from xml.etree import ElementTree as ET
 
+from utils.json_store import read_json, write_json_atomic
 from utils.paths import get_base_dir
 
 logger = logging.getLogger(__name__)
@@ -355,8 +356,7 @@ class RadikoManager:
     def _save_cache_file(self, cache):
         """キャッシュファイル全体を書き込む"""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.cache_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
+        write_json_atomic(self.cache_file, cache)
         self._schedule_cache_mem = cache
         try:
             self._schedule_cache_mtime = self.cache_file.stat().st_mtime
@@ -478,28 +478,114 @@ class RadikoManager:
 
         return data
 
+    # 番組画像のディスクキャッシュ（config/images）の上限。番組が入れ替わるたびに
+    # 新しい画像が増えていくため、上限なしだと使い続ける限り際限なく膨らむ
+    IMAGE_CACHE_MAX_BYTES = 100 * 1024 * 1024
+
+    def prune_image_cache(self):
+        """番組画像のディスクキャッシュが上限を超えていたら、古いものから削除する
+
+        毎回上限ぎりぎりで削除を繰り返さないよう、上限の8割まで減らす。削除した
+        画像がまた必要になった場合は get_image が取得し直すだけなので実害はない。
+
+        Returns:
+            int: 削除したファイル数
+        """
+        try:
+            with os.scandir(self.image_cache_dir) as it:
+                entries = [
+                    (entry.stat().st_mtime, entry.stat().st_size, entry.path)
+                    for entry in it if entry.is_file()
+                ]
+        except OSError:
+            return 0
+
+        total = sum(size for _, size, _ in entries)
+        if total <= self.IMAGE_CACHE_MAX_BYTES:
+            return 0
+
+        removed = 0
+        for _, size, path in sorted(entries):
+            if total <= self.IMAGE_CACHE_MAX_BYTES * 0.8:
+                break
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+        logger.info(f"番組画像キャッシュを整理しました（{removed}件削除）")
+        return removed
+
     def load_settings(self):
         """アプリ設定（既定局・番組表取得日数など）を読み込む
 
         Returns:
             dict: 設定がなければ空dict
         """
-        if not self.settings_file.exists():
-            return {}
-        try:
-            with open(self.settings_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
+        return self._load_config_file(self.settings_file, "settings", {})
 
     def save_settings(self, settings):
         """アプリ設定を保存する（既存の設定とマージ）"""
-        current = self.load_settings()
-        current.update(settings)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.settings_file, "w", encoding="utf-8") as f:
-            json.dump(current, f, ensure_ascii=False, indent=2)
-        self._export_backup()
+        with self._config_lock:
+            current = self.load_settings()
+            current.update(settings)
+            self._save_config_file(self.settings_file, current)
+
+    # 設定・予約一覧・フリーワード一覧の読み書きを直列化するロック。
+    # 「読む→書き換える→書き戻す」の途中に別スレッドの書き込みが割り込んで
+    # 変更が失われるのを防ぐ。_export_backup等から入れ子で取得するためRLock
+    _config_lock = threading.RLock()
+
+    def _load_config_file(self, path, backup_key, default):
+        """設定・予約一覧・フリーワード一覧のいずれかを読み込む（無ければdefault）
+
+        中身が壊れていて読めない場合、黙って空として扱うと、その後の保存で
+        自動バックアップ（settings_export.json）まで空で上書きされて復旧できなく
+        なる。そのため壊れたファイルは「<ファイル名>.corrupt」として退避し、
+        自動バックアップ内の該当部分（backup_key）から復元する。
+        """
+        with self._config_lock:
+            if not path.exists():
+                return default
+            try:
+                return read_json(path)
+            except OSError:
+                logger.exception(f"{path.name} を読み込めませんでした")
+                return default
+            except ValueError:
+                # JSONDecodeError（途中で切れている等）とUnicodeDecodeError（文字化け）の両方
+                logger.error(f"{path.name} が壊れています。自動バックアップからの復元を試みます")
+
+            try:
+                os.replace(path, path.with_name(path.name + ".corrupt"))
+            except OSError:
+                logger.exception(f"壊れた {path.name} を退避できませんでした")
+
+            restored = self._read_backup_section(backup_key)
+            if not isinstance(restored, type(default)):
+                logger.error(f"{path.name} を自動バックアップから復元できませんでした（空として扱います）")
+                return default
+            try:
+                write_json_atomic(path, restored)
+                logger.warning(f"{path.name} を自動バックアップから復元しました")
+            except OSError:
+                logger.exception(f"復元した {path.name} を書き戻せませんでした")
+            return restored
+
+    def _read_backup_section(self, backup_key):
+        """自動バックアップ（settings_export.json）から指定キーの内容を取り出す（読めなければNone）"""
+        try:
+            return read_json(self.export_file).get(backup_key)
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def _save_config_file(self, path, data):
+        """設定・予約一覧・フリーワード一覧のいずれかを保存し、自動バックアップも更新する"""
+        with self._config_lock:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(path, data)
+            self._export_backup()
 
     def _export_backup(self):
         """設定・予約一覧・フリーワード一覧をまとめて自動バックアップファイルに書き出す
@@ -507,35 +593,26 @@ class RadikoManager:
         設定変更時、および予約一覧・フリーワード一覧の更新時に毎回呼び出される。
         書き込みに失敗してもアプリ本来の動作は継続させたいため、例外は握りつぶす。
         """
-        data = {
-            "settings": self.load_settings(),
-            "reservations": self._load_reservations_file(),
-            "freeword_keywords": self._load_freeword_file(),
-        }
-        try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.export_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except OSError:
-            logger.exception("Error writing settings_export.json backup")
+        with self._config_lock:
+            data = {
+                "settings": self.load_settings(),
+                "reservations": self._load_reservations_file(),
+                "freeword_keywords": self._load_freeword_file(),
+            }
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                write_json_atomic(self.export_file, data)
+            except OSError:
+                logger.exception("Error writing settings_export.json backup")
 
     # 予約時刻を過ぎてもスケジューラの巡回間隔等の遅れを許容して録音を開始する猶予（秒）
     RESERVATION_GRACE_SECONDS = 180
 
     def _load_reservations_file(self):
-        if not self.reservations_file.exists():
-            return []
-        try:
-            with open(self.reservations_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return []
+        return self._load_config_file(self.reservations_file, "reservations", [])
 
     def _save_reservations_file(self, reservations):
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.reservations_file, "w", encoding="utf-8") as f:
-            json.dump(reservations, f, ensure_ascii=False, indent=2)
-        self._export_backup()
+        self._save_config_file(self.reservations_file, reservations)
 
     def replace_reservations(self, reservations):
         """予約録音の一覧を丸ごと置き換える（設定インポート用）"""
@@ -554,29 +631,32 @@ class RadikoManager:
 
     def add_reservation(self, data):
         """予約録音を新規追加する。dataにidを付与して保存する"""
-        reservations = self._load_reservations_file()
-        reservation = dict(data)
-        reservation['id'] = uuid.uuid4().hex
-        reservation.setdefault('enabled', True)
-        reservation.setdefault('last_run_date', None)
-        reservations.append(reservation)
-        self._save_reservations_file(reservations)
-        return reservation
+        with self._config_lock:
+            reservations = self._load_reservations_file()
+            reservation = dict(data)
+            reservation['id'] = uuid.uuid4().hex
+            reservation.setdefault('enabled', True)
+            reservation.setdefault('last_run_date', None)
+            reservations.append(reservation)
+            self._save_reservations_file(reservations)
+            return reservation
 
     def update_reservation(self, reservation_id, data):
         """既存の予約録音を更新する（dataの内容をマージ）"""
-        reservations = self._load_reservations_file()
-        for res in reservations:
-            if res.get('id') == reservation_id:
-                res.update(data)
-                break
-        self._save_reservations_file(reservations)
+        with self._config_lock:
+            reservations = self._load_reservations_file()
+            for res in reservations:
+                if res.get('id') == reservation_id:
+                    res.update(data)
+                    break
+            self._save_reservations_file(reservations)
 
     def delete_reservation(self, reservation_id):
         """予約録音を削除する"""
-        reservations = self._load_reservations_file()
-        reservations = [r for r in reservations if r.get('id') != reservation_id]
-        self._save_reservations_file(reservations)
+        with self._config_lock:
+            reservations = self._load_reservations_file()
+            reservations = [r for r in reservations if r.get('id') != reservation_id]
+            self._save_reservations_file(reservations)
 
     def mark_reservation_run(self, reservation_id, occurrence_date_iso, result=None):
         """予約録音を実行したことを記録する（同じ回の重複実行を防ぐため）
@@ -656,19 +736,10 @@ class RadikoManager:
         return due
 
     def _load_freeword_file(self):
-        if not self.freeword_file.exists():
-            return []
-        try:
-            with open(self.freeword_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return []
+        return self._load_config_file(self.freeword_file, "freeword_keywords", [])
 
     def _save_freeword_file(self, freewords):
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.freeword_file, "w", encoding="utf-8") as f:
-            json.dump(freewords, f, ensure_ascii=False, indent=2)
-        self._export_backup()
+        self._save_config_file(self.freeword_file, freewords)
 
     def replace_freewords(self, freewords):
         """フリーワードの一覧を丸ごと置き換える（設定インポート用）"""
@@ -952,6 +1023,51 @@ class RadikoManager:
         output_thread.start()
         return True
 
+    # 配信の取得中に通信エラーが起きたとき、諦めるまでに再試行を続ける秒数。
+    # 一瞬の瞬断やルーターの再起動程度（1〜2分）なら録音を打ち切らずに乗り切る
+    FETCH_RETRY_BUDGET_SECONDS = 120
+    # 再試行の待ち時間（秒）。1秒から始めて倍々に延ばし、この値で頭打ちにする
+    FETCH_RETRY_MAX_DELAY_SECONDS = 10
+
+    def _get_with_retry(self, get, url, stop_event, **kwargs):
+        """get(url, **kwargs) を、一時的な通信エラーなら再試行しながら実行する
+
+        再試行するのは接続エラー・タイムアウト・HTTP 5xx のみ。4xx（認証切れや
+        セッション切れ等）は待っても直らないため、そのままレスポンスを返して
+        呼び出し側の判断に任せる。FETCH_RETRY_BUDGET_SECONDS の間ずっと失敗し
+        続けた場合は、最後の例外を送出する（5xxなら最後のレスポンスを返す）。
+
+        get は requests.get または requests.Session.get。
+
+        Returns:
+            Response または None: 再試行の待機中に stop_event がセットされた
+            （停止要求があった）場合は None
+        """
+        deadline = time.monotonic() + self.FETCH_RETRY_BUDGET_SECONDS
+        delay = 1.0
+        retried = False
+        while True:
+            res = None
+            try:
+                res = get(url, **kwargs)
+                if res.status_code < 500:
+                    if retried:
+                        logger.info("通信が復旧しました。取得を再開します")
+                    return res
+                failure = f"HTTP {res.status_code}"
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if time.monotonic() + delay > deadline:
+                    raise
+                failure = type(e).__name__
+
+            if res is not None and time.monotonic() + delay > deadline:
+                return res
+            logger.warning(f"通信エラー（{failure}）のため{delay:.0f}秒後に再試行します")
+            retried = True
+            if stop_event.wait(delay):
+                return None
+            delay = min(delay * 2, self.FETCH_RETRY_MAX_DELAY_SECONDS)
+
     def _iter_live_segments(self, playlist_url, headers, stop_event):
         """マスタープレイリストを起点に、ライブ配信の新規セグメント(生のAACバイト列)を
         順次生成するジェネレーター。
@@ -959,7 +1075,11 @@ class RadikoManager:
         radikoのHLS配信は「マスタープレイリスト → メディアリスト(session付) → .aacセグメント」
         という構成。再生・録音の両方でこのジェネレーターを共有する。
         """
-        top_res = requests.get(playlist_url, headers=headers, timeout=10)
+        top_res = self._get_with_retry(
+            requests.get, playlist_url, stop_event, headers=headers, timeout=10
+        )
+        if top_res is None:
+            return
         top_res.raise_for_status()
         medialist_url = next(
             line.strip() for line in top_res.text.splitlines()
@@ -968,7 +1088,11 @@ class RadikoManager:
 
         last_sequence = -1
         while not stop_event.is_set():
-            media_res = requests.get(medialist_url, headers=headers, timeout=10)
+            media_res = self._get_with_retry(
+                requests.get, medialist_url, stop_event, headers=headers, timeout=10
+            )
+            if media_res is None:
+                return
             media_res.raise_for_status()
 
             media_sequence = 0
@@ -988,12 +1112,26 @@ class RadikoManager:
                 if media_sequence + i > last_sequence
             ]
 
+            # ライブのmedialistは直近の数セグメントしか載せていないため、通信断が
+            # 長引くとその間のセグメントは流れて消え、復旧後も取得できない
+            if last_sequence >= 0 and new_segments and new_segments[0][0] > last_sequence + 1:
+                logger.warning(
+                    f"ライブ配信: 通信断等により{new_segments[0][0] - last_sequence - 1}件の"
+                    "セグメントを取得できませんでした（その区間の音声は欠落します）"
+                )
+
             for seq, seg_url in new_segments:
                 if stop_event.is_set():
                     return
-                seg_res = requests.get(seg_url, timeout=10)
+                seg_res = self._get_with_retry(requests.get, seg_url, stop_event, timeout=10)
+                if seg_res is None:
+                    return
                 if seg_res.status_code == 200:
                     yield seg_res.content
+                else:
+                    logger.warning(
+                        f"ライブセグメント取得失敗: status={seg_res.status_code} url={seg_url}"
+                    )
                 last_sequence = seq
 
             if stop_event.is_set():
@@ -1163,7 +1301,11 @@ class RadikoManager:
         呼ばれる。
         """
         session = requests.Session()
-        top_res = session.get(playlist_url, headers=headers, timeout=10)
+        top_res = self._get_with_retry(
+            session.get, playlist_url, stop_event, headers=headers, timeout=10
+        )
+        if top_res is None:
+            return
         top_res.raise_for_status()
 
         if "#EXTINF" in top_res.text:
@@ -1187,7 +1329,11 @@ class RadikoManager:
         first_segment_dt = None
 
         while not stop_event.is_set():
-            media_res = session.get(medialist_url, headers=headers, timeout=10)
+            media_res = self._get_with_retry(
+                session.get, medialist_url, stop_event, headers=headers, timeout=10
+            )
+            if media_res is None:
+                return
             if media_res.status_code == 404 and done > 0:
                 # CDN側のセッションには寿命があるらしく、番組の終端付近で
                 # medialistが404になることがある（実機で確認済み）。既にいくらか
@@ -1245,7 +1391,9 @@ class RadikoManager:
                 # セグメント本体のURLは既に認証情報が埋め込まれた署名付きURLであることが多く、
                 # ここで X-Radiko-AuthToken ヘッダーを付けると拒否されることがある
                 # （_iter_live_segments のセグメント取得も同様の理由でヘッダーなし）。
-                seg_res = session.get(seg_url, timeout=10)
+                seg_res = self._get_with_retry(session.get, seg_url, stop_event, timeout=10)
+                if seg_res is None:
+                    return
                 if seg_res.status_code == 200:
                     yield seg_res.content
                 else:
@@ -1346,6 +1494,10 @@ class RadikoManager:
         except Exception:
             logger.exception("Error during live playback output")
         finally:
+            # 出力側が（音声デバイスの切断等で）異常終了した場合に取得側だけが動き続けると、
+            # 誰にも消費されないPCMがbufferに溜まり続けてメモリを食い潰す
+            # （実測で音声1時間あたり約800MB）。出力が終わったら取得側も必ず止める
+            stop_event.set()
             if stream_handle is not None:
                 try:
                     stream_handle.stop()

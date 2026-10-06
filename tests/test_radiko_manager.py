@@ -348,3 +348,246 @@ def test_prune_stale_schedule_cache_no_op_when_nothing_stale(manager):
     manager.station_mapping = {"NHK-FM": "JOAK-FM"}
     manager._save_cache_file({"NHK-FM": {"fetched_at": "2026-09-10T00:00:00", "programs": []}})
     assert manager.prune_stale_schedule_cache() == []
+
+
+# --- ライブ再生 --------------------------------------------------------------
+
+def test_playback_output_worker_stops_fetch_side_when_output_fails(manager, monkeypatch):
+    """出力側が異常終了したら stop_event を立てて取得側も止める
+    （立てないと、消費されないPCMがバッファに溜まり続けてメモリを食い潰す）"""
+    import sys
+    import threading
+    import types
+
+    from utils.radiko_manager import _LiveAudioBuffer
+
+    def failing_stream(**kwargs):
+        raise RuntimeError("audio device lost")
+
+    monkeypatch.setitem(
+        sys.modules, "sounddevice", types.SimpleNamespace(RawOutputStream=failing_stream)
+    )
+    monkeypatch.setattr(manager, "PLAYBACK_PREBUFFER_SECONDS", 0.0)
+    buffer = _LiveAudioBuffer()
+    buffer.sample_rate = 48000
+    buffer.push(b"\x00" * 4096)
+    stop_event = threading.Event()
+
+    manager._playback_output_worker(stop_event, buffer)
+
+    assert stop_event.is_set()
+
+
+# --- 設定・予約ファイルの保存と破損からの復元 ------------------------------------
+
+def test_save_leaves_no_temp_file_and_updates_backup(manager):
+    import json
+
+    manager.add_reservation({"station": "TBS", "start": "01:00", "end": "02:00"})
+
+    assert not list(manager.cache_dir.glob("*.tmp"))
+    backup = json.loads(manager.export_file.read_text(encoding="utf-8"))
+    assert len(backup["reservations"]) == 1
+
+
+def test_interrupted_save_keeps_previous_file(manager, monkeypatch):
+    """書き込みの途中で落ちても、元のファイルは直前の内容のまま残る"""
+    import json
+
+    import utils.json_store as json_store
+
+    manager.add_reservation({"station": "TBS", "start": "01:00", "end": "02:00"})
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("killed mid-write")
+
+    monkeypatch.setattr(json_store.json, "dump", crash)
+    try:
+        manager.add_reservation({"station": "QRR", "start": "03:00", "end": "04:00"})
+    except KeyboardInterrupt:
+        pass
+    monkeypatch.undo()
+
+    saved = json.loads(manager.reservations_file.read_text(encoding="utf-8"))
+    assert [r["station"] for r in saved] == ["TBS"]
+
+
+def test_corrupt_reservations_are_restored_from_backup(manager):
+    """壊れた予約ファイルを空扱いにせず、自動バックアップから復元する
+    （空扱いにすると、次の保存でバックアップまで空で上書きされる）"""
+    import json
+
+    manager.add_reservation({"station": "TBS", "start": "01:00", "end": "02:00"})
+    manager.add_reservation({"station": "QRR", "start": "03:00", "end": "04:00"})
+    manager.reservations_file.write_text('[{"station": "TB', encoding="utf-8")
+
+    manager.save_settings({"prevent_sleep": True})
+
+    assert [r["station"] for r in manager.load_reservations()] == ["TBS", "QRR"]
+    backup = json.loads(manager.export_file.read_text(encoding="utf-8"))
+    assert len(backup["reservations"]) == 2
+    assert (manager.cache_dir / "reservations.json.corrupt").exists()
+
+
+def test_corrupt_reservations_without_backup_load_as_empty(manager):
+    manager.reservations_file.write_text("", encoding="utf-8")
+
+    assert manager.load_reservations() == []
+    assert not manager.reservations_file.exists()
+    assert (manager.cache_dir / "reservations.json.corrupt").exists()
+
+
+# --- 通信エラー時の再試行 ------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code=200, text="", content=b""):
+        self.status_code = status_code
+        self.text = text
+        self.content = content
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code}")
+
+
+class _InstantEvent:
+    """wait()で実際には待たない threading.Event の代用（再試行の待ち時間を省く）"""
+
+    def __init__(self):
+        self._set = False
+
+    def is_set(self):
+        return self._set
+
+    def set(self):
+        self._set = True
+
+    def wait(self, timeout=None):
+        return self._set
+
+
+def test_get_with_retry_recovers_from_transient_errors(manager):
+    import requests
+
+    outcomes = [
+        requests.exceptions.ReadTimeout("timed out"),
+        requests.exceptions.ConnectionError("unreachable"),
+        _FakeResponse(503),
+        _FakeResponse(200, text="ok"),
+    ]
+
+    def fake_get(url, **kwargs):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    res = manager._get_with_retry(fake_get, "http://x/", _InstantEvent(), timeout=10)
+
+    assert res.text == "ok"
+    assert outcomes == []
+
+
+def test_get_with_retry_does_not_retry_client_errors(manager):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return _FakeResponse(403)
+
+    res = manager._get_with_retry(fake_get, "http://x/", _InstantEvent())
+
+    assert res.status_code == 403
+    assert len(calls) == 1
+
+
+def test_get_with_retry_gives_up_after_budget(manager, monkeypatch):
+    import pytest
+    import requests
+
+    monkeypatch.setattr(manager, "FETCH_RETRY_BUDGET_SECONDS", 0)
+
+    def fake_get(url, **kwargs):
+        raise requests.exceptions.ConnectionError("unreachable")
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        manager._get_with_retry(fake_get, "http://x/", _InstantEvent())
+
+
+def test_get_with_retry_returns_none_when_stopped_while_waiting(manager):
+    import threading
+
+    import requests
+
+    stop_event = threading.Event()
+
+    def fake_get(url, **kwargs):
+        stop_event.set()
+        raise requests.exceptions.ConnectionError("unreachable")
+
+    assert manager._get_with_retry(fake_get, "http://x/", stop_event) is None
+
+
+def test_iter_live_segments_survives_single_medialist_failure(manager, monkeypatch):
+    """medialistの取得が1回失敗しただけでは録音を打ち切らない"""
+    import requests
+
+    import utils.radiko_manager as radiko_manager
+
+    polls = {"count": 0}
+
+    def fake_get(url, headers=None, timeout=None):
+        if "master" in url:
+            return _FakeResponse(text="#EXTM3U\nhttp://x/medialist.m3u8\n")
+        if "medialist" in url:
+            polls["count"] += 1
+            if polls["count"] == 3:
+                raise requests.exceptions.ReadTimeout("timed out")
+            return _FakeResponse(text=(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:5\n"
+                f"#EXT-X-MEDIA-SEQUENCE:{polls['count']}\nhttp://x/seg{polls['count']}.aac\n"
+            ))
+        return _FakeResponse(content=url.encode())
+
+    monkeypatch.setattr(radiko_manager.requests, "get", fake_get)
+    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+
+    segments = []
+    for segment in manager._iter_live_segments("http://x/master.m3u8", {}, _InstantEvent()):
+        segments.append(segment)
+        if len(segments) == 5:
+            break
+
+    assert len(segments) == 5
+
+
+# --- 番組画像のディスクキャッシュ ------------------------------------------------
+
+def test_prune_image_cache_removes_oldest_until_under_limit(manager, monkeypatch):
+    import os
+
+    manager.image_cache_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        path = manager.image_cache_dir / f"{i}.jpg"
+        path.write_bytes(b"x" * 100)
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+    monkeypatch.setattr(manager, "IMAGE_CACHE_MAX_BYTES", 500)
+
+    removed = manager.prune_image_cache()
+
+    # 上限500の8割（400バイト＝4件）まで、古いものから削除する
+    assert removed == 6
+    assert sorted(p.name for p in manager.image_cache_dir.iterdir()) == [
+        "6.jpg", "7.jpg", "8.jpg", "9.jpg"
+    ]
+
+
+def test_prune_image_cache_no_op_when_under_limit_or_missing(manager):
+    assert manager.prune_image_cache() == 0
+
+    manager.image_cache_dir.mkdir(parents=True, exist_ok=True)
+    (manager.image_cache_dir / "a.jpg").write_bytes(b"x" * 100)
+
+    assert manager.prune_image_cache() == 0
+    assert (manager.image_cache_dir / "a.jpg").exists()

@@ -84,6 +84,8 @@ def app(monkeypatch, tmp_path, shared_root):
         self.settings_file = self.cache_dir / "settings.json"
         self.reservations_file = self.cache_dir / "reservations.json"
         self.freeword_file = self.cache_dir / "freeword_keywords.json"
+        self.export_file = self.cache_dir / "settings_export.json"
+        self.image_cache_dir = self.cache_dir / "images"
 
     monkeypatch.setattr(RadikoManager, "__init__", patched_init)
 
@@ -552,3 +554,148 @@ def test_timefree_columns_ordered_oldest_to_newest_left_to_right(app):
         for offset in range(3, -1, -1)
     ]
     assert labels == expected
+
+
+def test_wrap_cache_is_bounded(app, monkeypatch):
+    """折り返し結果のキャッシュは上限件数を超えて増え続けない"""
+    monkeypatch.setattr(app, "WRAP_CACHE_MAX_ENTRIES", 5)
+    app._wrap_cache.clear()
+
+    for i in range(20):
+        app._wrap_lines(f"番組{i}", app.schedule_title_font, 100, 2)
+
+    assert len(app._wrap_cache) <= 5
+
+
+def test_image_cache_is_bounded_and_keeps_newest(app, monkeypatch):
+    """番組画像のキャッシュは上限件数を超えたら古いものから捨てる"""
+    monkeypatch.setattr(app, "IMAGE_CACHE_MAX_ENTRIES", 3)
+    monkeypatch.setattr(app.manager, "get_image", lambda url: None)
+    app._image_cache.clear()
+
+    for i in range(10):
+        app._get_program_image(f"https://example.invalid/{i}.jpg")
+
+    assert list(app._image_cache) == [f"https://example.invalid/{i}.jpg" for i in (7, 8, 9)]
+
+
+# --- 予約録音の開始失敗・途中中断からの再開 ----------------------------------------
+
+def _add_due_reservation(app, minutes=60):
+    """今ちょうど開始時刻を迎えた単発予約を1件追加する"""
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    return app.manager.add_reservation({
+        "station": app.manager.get_stations()[0],
+        "title": "テスト番組",
+        "repeat": "once",
+        "date_iso": now.date().isoformat(),
+        "start": now.strftime("%H:%M"),
+        "end": (now + timedelta(minutes=minutes)).strftime("%H:%M"),
+    })
+
+
+def _record_after_calls(app, monkeypatch):
+    """root.after を実際には予約せず、呼び出し内容だけ記録する（テスト後にジョブを残さない）"""
+    calls = []
+    monkeypatch.setattr(
+        app.root, "after", lambda ms, func=None, *args: calls.append((ms, func, args)) or "job"
+    )
+    return calls
+
+
+def test_reservation_start_failure_keeps_retrying_until_program_ends(app, monkeypatch):
+    """開始時の通信エラー1回でその回を諦めず、番組終了まで再試行を予約する"""
+    reservation = _add_due_reservation(app)
+    monkeypatch.setattr(app.manager, "start_recording", lambda *a, **k: (False, None))
+    calls = _record_after_calls(app, monkeypatch)
+
+    app._check_due_reservations()
+
+    resumes = [c for c in calls if c[1] == app._resume_reservation_recording]
+    assert len(resumes) == 1
+    assert resumes[0][0] == app.RESERVATION_RESUME_RETRY_SECONDS * 1000
+    assert resumes[0][2][0] == reservation["id"]
+    # 実行済みとして記録されているので、通常の巡回からは二重に開始されない
+    assert app.manager.get_due_reservations() == []
+
+
+def test_resumed_reservation_is_recorded_as_partial_even_if_rest_succeeds(app, monkeypatch):
+    from datetime import datetime, timedelta
+
+    reservation = _add_due_reservation(app)
+    station = reservation["station"]
+    occurrence = datetime.now().date().isoformat()
+    end_dt = datetime.now() + timedelta(minutes=60)
+    started = []
+    monkeypatch.setattr(app.manager, "start_recording", lambda *a, **k: (False, None))
+    _record_after_calls(app, monkeypatch)
+    app._check_due_reservations()
+
+    monkeypatch.setattr(
+        app.manager, "start_recording", lambda *a, **k: started.append(a) or (True, "x.aac")
+    )
+    monkeypatch.setattr(app, "_register_active_recording", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_watch_background_recording", lambda *a, **k: None)
+    app._resume_reservation_recording(reservation["id"], occurrence, end_dt)
+    assert len(started) == 1
+
+    app._on_reservation_recording_complete(
+        reservation["id"], occurrence, station, True, "x.aac", None, end_dt
+    )
+
+    assert app.manager.get_reservation(reservation["id"])["last_result"] == "partial"
+    assert app._reservation_resume_state == {}
+
+
+def test_interrupted_reservation_recording_schedules_resume(app, monkeypatch):
+    from datetime import datetime, timedelta
+
+    reservation = _add_due_reservation(app)
+    occurrence = datetime.now().date().isoformat()
+    calls = _record_after_calls(app, monkeypatch)
+
+    app._on_reservation_recording_complete(
+        reservation["id"], occurrence, reservation["station"], True, "x.aac", "timed out",
+        datetime.now() + timedelta(minutes=30),
+    )
+
+    assert [c for c in calls if c[1] == app._resume_reservation_recording]
+    assert app.manager.get_reservation(reservation["id"])["last_result"] == "partial"
+
+
+def test_interrupted_reservation_recording_does_not_resume_near_program_end(app, monkeypatch):
+    from datetime import datetime, timedelta
+
+    reservation = _add_due_reservation(app)
+    occurrence = datetime.now().date().isoformat()
+    calls = _record_after_calls(app, monkeypatch)
+
+    app._on_reservation_recording_complete(
+        reservation["id"], occurrence, reservation["station"], True, "x.aac", "timed out",
+        datetime.now() + timedelta(seconds=20),
+    )
+
+    assert not [c for c in calls if c[1] == app._resume_reservation_recording]
+    assert app._reservation_resume_state == {}
+
+
+def test_reservation_resume_backs_off_and_stops_when_reservation_deleted(app, monkeypatch):
+    from datetime import datetime, timedelta
+
+    reservation = _add_due_reservation(app)
+    occurrence = datetime.now().date().isoformat()
+    end_dt = datetime.now() + timedelta(hours=2)
+    calls = _record_after_calls(app, monkeypatch)
+    monkeypatch.setattr(app.manager, "start_recording", lambda *a, **k: (False, None))
+
+    for _ in range(3):
+        app._resume_reservation_recording(reservation["id"], occurrence, end_dt)
+    assert [c[0] for c in calls if c[1] == app._resume_reservation_recording] == [15000, 30000, 60000]
+
+    app.manager.delete_reservation(reservation["id"])
+    calls.clear()
+    app._resume_reservation_recording(reservation["id"], occurrence, end_dt)
+    assert calls == []
+    assert app._reservation_resume_state == {}

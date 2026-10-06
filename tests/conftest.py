@@ -24,4 +24,6 @@ def manager(monkeypatch, tmp_path):
     m.settings_file = m.cache_dir / "settings.json"
     m.reservations_file = m.cache_dir / "reservations.json"
     m.freeword_file = m.cache_dir / "freeword_keywords.json"
+    m.export_file = m.cache_dir / "settings_export.json"
+    m.image_cache_dir = m.cache_dir / "images"
     return m

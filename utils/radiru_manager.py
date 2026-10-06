@@ -20,6 +20,7 @@ from functools import lru_cache
 import av
 import requests
 
+from utils.json_store import write_json_atomic
 from utils.paths import get_base_dir
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ _HEADERS = {
 _KANA_ROWS = ("a", "k", "s", "t", "n", "h", "m", "y", "r", "w")
 
 _ONAIR_DATE_PATTERN = re.compile(r"(\d{1,2})月(\d{1,2})日")
+_AA_START_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\+09:00_")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
 
@@ -58,6 +60,10 @@ class RadiruManager:
     # 返すスナップショットであることを検証済み。1日あたりの入れ替わりは
     # 20〜50件程度なので、この間隔でも取りこぼしの心配はほぼない
     INDEX_REFRESH_INTERVAL_HOURS = 12
+
+    # 聴き逃しダウンロード中、1パケットも読めないまま読み出しエラーが
+    # この回数続いたら、復帰不能とみなして失敗にする
+    MAX_CONSECUTIVE_DEMUX_ERRORS = 20
 
     def __init__(self):
         self.cache_dir = get_base_dir() / "config"
@@ -98,8 +104,7 @@ class RadiruManager:
 
     def _save_index_file(self, index):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
+        write_json_atomic(self.index_file, index)
         self._index_mem = index
         try:
             self._index_mtime = self.index_file.stat().st_mtime
@@ -249,14 +254,44 @@ class RadiruManager:
         r.raise_for_status()
         return r.json().get("episodes", [])
 
-    def find_episode_for_date(self, episodes, target_date):
+    @staticmethod
+    def _episode_start(episode):
+        """エピソードの放送開始日時を返す（分からなければNone）
+
+        aa_contents_idの末尾に「2026-10-05T22:30:00+09:00_2026-10-05T23:20:00+09:00」
+        の形で放送枠が入っているため、そこから開始日時（JST、naive）を取り出す。
+        """
+        m = _AA_START_PATTERN.search(episode.get("aa_contents_id") or "")
+        if not m:
+            return None
+        try:
+            return datetime.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+
+    def find_episode_for_date(self, episodes, target_date, target_end=None):
         """target_date（dateまたはdatetime）に放送されたエピソードを探す
 
-        onair_dateは「9月30日(水)午後9:05放送」のような日本語表記のため、
-        年またぎの誤判定を避け月日のみで比較する。
+        target_end（datetime または None）: 番組の終了日時。target_dateと
+        両方がdatetimeで、エピソード側の放送開始日時も分かる場合は、開始日時が
+        番組の放送枠 [target_date, target_end) に入っているものだけを採る。
+        同じ日に本放送と再放送がある番組（「マイ・フェイバリット・アルバム」は
+        午後6時が再放送、午後10時30分が本放送で、聴き逃しは本放送のみ）で、
+        月日だけで照合すると再放送の枠から別の回を取得してしまうため。
+        完全一致ではなく枠内判定なのは、コーナーのエピソードは親番組の途中から
+        始まるため。
+
+        エピソード側の開始日時が分からない場合は従来どおり、onair_date
+        （「9月30日(水)午後9:05放送」のような日本語表記）の月日のみで比較する。
         """
+        check_window = isinstance(target_date, datetime) and target_end is not None
         target_md = (target_date.month, target_date.day)
         for ep in episodes:
+            ep_start = self._episode_start(ep) if check_window else None
+            if ep_start is not None:
+                if target_date <= ep_start < target_end:
+                    return ep
+                continue
             m = _ONAIR_DATE_PATTERN.search(ep.get("onair_date", ""))
             if m and (int(m.group(1)), int(m.group(2))) == target_md:
                 return ep
@@ -275,20 +310,27 @@ class RadiruManager:
 
         radikoのタイムフリーと異なり暗号化・セグメント個別取得は不要で、
         通常のHLS（AES-128暗号化、PyAV/ffmpegが自動復号）としてPyAVから
-        直接デマックスできることを検証済み。ただし2点、元パケットをそのまま
-        使うと問題が起きることが分かっている。
+        直接デマックスできることを検証済み。ただし以下の点に注意が必要。
 
-        1. HLSのセグメント境界でタイムスタンプがリセットされる（後方に戻る）
+        1. NHKの配信サーバーは、Rangeヘッダー付きのリクエスト（ffmpegは既定で
+           "Range: bytes=0-" を送る）に対して、暗号化セグメントの末尾を
+           PKCS7パディングの長さぶん（1〜16バイト）切り詰めて返す。最後の
+           AESブロックが欠けるため復号結果の末尾が壊れ、セグメント（6秒）
+           ごとに1フレーム〜約0.85秒の音声が欠落し、"Invalid data found"が
+           読み出し・mux の両方で散発していた（50分番組で約85秒の欠落）。
+           http_seekable=0 でRangeヘッダーを送らないようにすると、欠落も
+           エラーも発生しないことを実測で確認済み。
+        2. HLSのセグメント境界でタイムスタンプがリセットされる（後方に戻る）
            ことがあり、元のpts/dtsのまま使うと出力ファイル生成時に
            "Invalid data found" で失敗する（radiko側のセグメント結合処理
            _recording_workerと同じ問題）。そのため元の値は無視し、パケットの
            durationを積算した連番のタイムスタンプを振り直す。
-        2. 各セグメント（6秒毎、AES-128で個別に暗号化されている）の先頭1
-           フレームが、コンテナ境界をまたいだ復号のずれにより壊れていることが
-           あり、そのままmuxすると同じ"Invalid data found"で例外になる
-           （実測で約140フレームに1回＝セグメント毎に1回発生。1フレーム
-           ＝約21〜43ms分の欠落で聴感上ほぼ影響しない）。該当パケットのみ
-           読み飛ばし、後続の取得は継続する。
+
+        1.の対処後は発生しない見込みだが、サーバー側の挙動が変わった場合に
+        全体が失敗しないよう、壊れたパケットのmux失敗は読み飛ばし、読み出し
+        側のエラーもdemux()を呼び直して続きから継続する。通信断などで復帰
+        しない場合に無限に繰り返さないよう、1パケットも読めないまま連続で
+        失敗した回数に上限を設ける。
         """
         logger.info(f"聴き逃しダウンロード開始: {stream_url} -> {output_path}")
         container = av.open(
@@ -299,6 +341,9 @@ class RadiruManager:
                 # （単位はマイクロ秒）。セグメント取得先での瞬断等で無限待ちに
                 # ならないようにするための安全策
                 "timeout": "20000000",
+                # Rangeヘッダーを送らない（送るとセグメント末尾が切り詰められて
+                # 音声が欠落する。docstringの1.を参照）
+                "http_seekable": "0",
             },
         )
         try:
@@ -314,31 +359,42 @@ class RadiruManager:
                 pts_counter = 0
                 skipped = 0
                 packet_count = 0
-                for packet in container.demux(audio_stream):
-                    if packet.dts is None:
-                        continue
-                    duration = packet.duration or 0
-                    packet.pts = pts_counter
-                    packet.dts = pts_counter
-                    packet.stream = out_stream
+                demux_errors = 0
+                consecutive_demux_errors = 0
+                while True:
                     try:
-                        output_container.mux(packet)
+                        for packet in container.demux(audio_stream):
+                            consecutive_demux_errors = 0
+                            if packet.dts is None:
+                                continue
+                            duration = packet.duration or 0
+                            packet.pts = pts_counter
+                            packet.dts = pts_counter
+                            packet.stream = out_stream
+                            try:
+                                output_container.mux(packet)
+                            except av.FFmpegError:
+                                # "Invalid data found"以外に、実測で"Not yet implemented in
+                                # FFmpeg"も稀に発生することを確認済みのため、特定のエラー型に
+                                # 絞らずFFmpegError全般を読み飛ばし対象にする
+                                skipped += 1
+                                continue
+                            finally:
+                                pts_counter += duration
+                            packet_count += 1
+                            if on_progress is not None and packet_count % 100 == 0:
+                                on_progress(pts_counter * float(audio_stream.time_base), total_seconds)
+                        break
                     except av.FFmpegError:
-                        # "Invalid data found"以外に、実測で"Not yet implemented in
-                        # FFmpeg"も稀に発生することを確認済みのため、特定のエラー型に
-                        # 絞らずFFmpegError全般を読み飛ばし対象にする
-                        skipped += 1
-                        continue
-                    finally:
-                        pts_counter += duration
-                    packet_count += 1
-                    if on_progress is not None and packet_count % 100 == 0:
-                        on_progress(pts_counter * float(audio_stream.time_base), total_seconds)
+                        demux_errors += 1
+                        consecutive_demux_errors += 1
+                        if consecutive_demux_errors >= self.MAX_CONSECUTIVE_DEMUX_ERRORS:
+                            raise
                 if on_progress is not None:
                     on_progress(pts_counter * float(audio_stream.time_base), total_seconds)
                 logger.info(
                     f"聴き逃しダウンロード完了: {output_path} "
-                    f"({packet_count}パケット, {skipped}件読み飛ばし)"
+                    f"({packet_count}パケット, {skipped}件読み飛ばし, 読み出しエラー{demux_errors}回)"
                 )
             finally:
                 output_container.close()
