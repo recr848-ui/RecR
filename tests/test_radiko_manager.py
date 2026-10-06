@@ -591,3 +591,50 @@ def test_prune_image_cache_no_op_when_under_limit_or_missing(manager):
 
     assert manager.prune_image_cache() == 0
     assert (manager.image_cache_dir / "a.jpg").exists()
+
+
+def test_write_json_atomic_retries_then_succeeds_when_replace_is_briefly_denied(tmp_path, monkeypatch):
+    """差し替えが一時的に拒否されても（ウイルス対策ソフトの検査中など）、再試行して保存する"""
+    import json
+    import os
+
+    import utils.json_store as json_store
+
+    target = tmp_path / "data.json"
+    real_replace = os.replace
+    attempts = {"count": 0}
+
+    def flaky_replace(src, dst):
+        attempts["count"] += 1
+        if attempts["count"] < 4:
+            raise PermissionError("in use")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(json_store.os, "replace", flaky_replace)
+    monkeypatch.setattr(json_store.time, "sleep", lambda seconds: None)
+
+    json_store.write_json_atomic(target, {"a": 1})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
+    assert attempts["count"] == 4
+
+
+def test_write_json_atomic_falls_back_to_direct_write_when_replace_keeps_failing(tmp_path, monkeypatch):
+    """差し替えがずっと拒否され続ける場合も、保存自体は諦めず直接上書きする"""
+    import json
+
+    import utils.json_store as json_store
+
+    target = tmp_path / "data.json"
+    target.write_text('{"old": true}', encoding="utf-8")
+
+    def denied(src, dst):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(json_store.os, "replace", denied)
+    monkeypatch.setattr(json_store.time, "sleep", lambda seconds: None)
+
+    json_store.write_json_atomic(target, {"a": 1})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
+    assert not list(tmp_path.glob("*.tmp"))

@@ -7,8 +7,11 @@ open(path, "w") で直接上書きすると、開いた瞬間にファイルが0
 なった」のどちらかにしかならないため、どの時点で落ちても壊れたファイルは残らない。
 """
 import json
+import logging
 import os
 import time
+
+logger = logging.getLogger(__name__)
 
 
 def write_json_atomic(path, data):
@@ -24,16 +27,28 @@ def write_json_atomic(path, data):
         f.flush()
         os.fsync(f.fileno())
 
-    # Windowsでは差し替え先を他のプロセス（ウイルス対策ソフトやバックアップソフト等）が
-    # 開いている間 os.replace が PermissionError になるため、少し待って再試行する
-    for attempt in range(10):
+    # Windowsでは、書いたばかりの一時ファイルや差し替え先を他のプロセス（ウイルス対策
+    # ソフトの検査やバックアップソフト等）が開いている間、os.replace が PermissionError に
+    # なる（PCの負荷が高いときに0.5秒以上続くことを実機で確認済み）。待ち時間を
+    # 延ばしながら合計3秒ほど再試行する
+    delay = 0.05
+    for _ in range(10):
         try:
             os.replace(tmp_path, path)
             return
         except PermissionError:
-            if attempt == 9:
-                raise
-            time.sleep(0.05)
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
+
+    # それでも差し替えられない場合、保存自体を諦めるよりは、従来どおり直接上書きする
+    # （この書き込みの途中で落ちると壊れ得るが、保存できないよりはよい）
+    logger.warning(f"{path.name} を一時ファイルから差し替えられなかったため、直接上書きします")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
 
 
 def read_json(path):
