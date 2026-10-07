@@ -562,6 +562,169 @@ def test_iter_live_segments_survives_single_medialist_failure(manager, monkeypat
     assert len(segments) == 5
 
 
+def _fake_live_get_with_expiring_session(expired_sessions):
+    """マスタープレイリストを取るたびに新しいセッションを払い出し、expired_sessions に
+    含まれるセッションのmedialistは404を返す requests.get の代用"""
+    state = {"session": 0, "polls": 0}
+
+    def fake_get(url, headers=None, timeout=None):
+        if "master" in url:
+            state["session"] += 1
+            return _FakeResponse(text=f"#EXTM3U\nhttp://x/medialist.m3u8?session={state['session']}\n")
+        if "medialist" in url:
+            state["polls"] += 1
+            session = int(url.rsplit("=", 1)[1])
+            if session in expired_sessions(state):
+                return _FakeResponse(404)
+            return _FakeResponse(text=(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:5\n"
+                f"#EXT-X-MEDIA-SEQUENCE:{state['polls']}\nhttp://x/s{session}_{state['polls']}.aac\n"
+            ))
+        return _FakeResponse(content=url.encode())
+
+    return fake_get, state
+
+
+def test_iter_live_segments_renews_session_when_medialist_expires(manager, monkeypatch):
+    """通信断のあいだにセッションが切れてmedialistが404になっても、取り直して続行する"""
+    import utils.radiko_manager as radiko_manager
+
+    # 3回目のポーリング以降、最初のセッションは期限切れになる
+    fake_get, state = _fake_live_get_with_expiring_session(
+        lambda state: {1} if state["polls"] >= 3 else set()
+    )
+    monkeypatch.setattr(radiko_manager.requests, "get", fake_get)
+    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+
+    segments = []
+    for segment in manager._iter_live_segments("http://x/master.m3u8", {}, _InstantEvent()):
+        segments.append(segment)
+        if len(segments) == 5:
+            break
+
+    assert len(segments) == 5
+    assert state["session"] == 2
+    assert segments[-1].startswith(b"http://x/s2_")
+
+
+def test_iter_live_segments_gives_up_when_renewed_session_also_fails(manager, monkeypatch):
+    """取り直したセッションも直後に4xxなら、無限に取り直さず例外にする"""
+    import pytest
+    import requests
+
+    import utils.radiko_manager as radiko_manager
+
+    fake_get, state = _fake_live_get_with_expiring_session(lambda state: {1, 2, 3, 4})
+    monkeypatch.setattr(radiko_manager.requests, "get", fake_get)
+    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(requests.HTTPError):
+        list(manager._iter_live_segments("http://x/master.m3u8", {}, _InstantEvent()))
+
+    assert state["session"] == 2
+
+
+# --- タイムフリー取得中のセッション切れ ----------------------------------------
+
+_TF_BASE = datetime(2026, 10, 4, 19, 30, 0)
+
+
+def _install_fake_timefree_server(monkeypatch, expired_sessions):
+    """タイムフリー配信の代用を requests.Session に差し込む
+
+    プレイリストを取るたびに新しいセッションを払い出す。medialistは5秒刻みの
+    セグメントを3件ずつ、ポーリングのたびに1件ずつ進めて返す。expired_sessions に
+    含まれるセッションは、3回目のポーリングから404を返す（通信断で期限切れになった
+    状況の再現）。取り直したセッションは、指定された開始時刻の1件手前から始める
+    （開始時刻を秒単位に丸めたせいで取得済みの1件が重複する状況の再現）。
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    import utils.radiko_manager as radiko_manager
+
+    sessions = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        query = parse_qs(urlparse(url).query)
+        if "/playlist" in url:
+            number = len(sessions) + 1
+            start = datetime.strptime(query["ft"][0], "%Y%m%d%H%M%S")
+            if number > 1:
+                start -= timedelta(seconds=5)
+            sessions[number] = {"start": start, "polls": 0}
+            return _FakeResponse(text=f"#EXTM3U\nhttp://x/medialist?session={number}\n")
+        if "/medialist" in url:
+            number = int(query["session"][0])
+            state = sessions[number]
+            if number in expired_sessions and state["polls"] >= 2:
+                return _FakeResponse(404)
+            first = state["polls"]
+            state["polls"] += 1
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:5", f"#EXT-X-MEDIA-SEQUENCE:{first}"]
+            for i in range(first, first + 3):
+                seg_dt = state["start"] + timedelta(seconds=5 * i)
+                lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{seg_dt.isoformat()}+09:00")
+                lines.append(f"http://x/seg/{seg_dt:%H%M%S}")
+            return _FakeResponse(text="\n".join(lines) + "\n")
+        return _FakeResponse(content=url.rsplit("/", 1)[1].encode())
+
+    class FakeSession:
+        get = staticmethod(fake_get)
+
+    monkeypatch.setattr(radiko_manager.requests, "Session", FakeSession)
+    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+    return sessions
+
+
+def _tf_playlist_url(ft_dt):
+    return f"http://x/playlist?ft={ft_dt:%Y%m%d%H%M%S}"
+
+
+def test_iter_timefree_segments_resumes_from_where_session_expired(manager, monkeypatch):
+    """途中でmedialistが404になっても完了扱いにせず、続きの時刻から取り直して最後まで取る"""
+    sessions = _install_fake_timefree_server(monkeypatch, expired_sessions={1})
+
+    segments = list(manager._iter_timefree_segments(
+        _tf_playlist_url(_TF_BASE), {}, _InstantEvent(), _TF_BASE + timedelta(seconds=60),
+        renew_playlist_url=_tf_playlist_url,
+    ))
+
+    expected = [f"1930{second:02d}".encode() for second in range(0, 60, 5)]
+    assert segments == expected
+    assert len(sessions) == 2
+
+
+def test_iter_timefree_segments_fails_when_it_cannot_resume(manager, monkeypatch):
+    """取り直しても進まない（取り直した先も404）なら、途中までを成功扱いにせず例外にする"""
+    import pytest
+    import requests
+
+    _install_fake_timefree_server(monkeypatch, expired_sessions={1, 2, 3})
+
+    def renew_without_progress(ft_dt):
+        # 取り直した先が1件も新しいセグメントを返さない状況にするため、
+        # 取得済みの範囲しか載らない時刻から始めさせる
+        return _tf_playlist_url(_TF_BASE - timedelta(seconds=5))
+
+    with pytest.raises(requests.HTTPError):
+        list(manager._iter_timefree_segments(
+            _tf_playlist_url(_TF_BASE), {}, _InstantEvent(), _TF_BASE + timedelta(seconds=60),
+            renew_playlist_url=renew_without_progress,
+        ))
+
+
+def test_iter_timefree_segments_treats_404_near_the_end_as_complete(manager, monkeypatch):
+    """番組の終端付近での404は、これまでどおり正常終了とする"""
+    _install_fake_timefree_server(monkeypatch, expired_sessions={1})
+
+    segments = list(manager._iter_timefree_segments(
+        _tf_playlist_url(_TF_BASE), {}, _InstantEvent(), _TF_BASE + timedelta(seconds=30),
+        renew_playlist_url=_tf_playlist_url,
+    ))
+
+    assert segments == [b"193000", b"193005", b"193010", b"193015"]
+
+
 # --- 番組画像のディスクキャッシュ ------------------------------------------------
 
 def test_prune_image_cache_removes_oldest_until_under_limit(manager, monkeypatch):

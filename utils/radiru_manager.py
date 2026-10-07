@@ -65,6 +65,14 @@ class RadiruManager:
     # この回数続いたら、復帰不能とみなして失敗にする
     MAX_CONSECUTIVE_DEMUX_ERRORS = 20
 
+    # 聴き逃しダウンロード中、この秒数のあいだ1パケットも届かなければ通信断と
+    # みなして失敗にする。FFmpegのHLS読み込みは取得できないセグメントを黙って
+    # 飛ばして先へ進むため、放っておくと通信断のあいだ延々と飛ばし続ける
+    DOWNLOAD_STALL_TIMEOUT_SECONDS = 60
+    # 配信側の尺に対して、保存できた長さがこの秒数を超えて短ければ欠落ありと
+    # みなして失敗にする（セグメントは1件6秒。1件でも飛ばされたら検出する）
+    DOWNLOAD_SHORTFALL_TOLERANCE_SECONDS = 3
+
     def __init__(self):
         self.cache_dir = get_base_dir() / "config"
         self.index_file = self.cache_dir / "radiru_series_index.json"
@@ -345,6 +353,9 @@ class RadiruManager:
                 # 音声が欠落する。docstringの1.を参照）
                 "http_seekable": "0",
             },
+            # （接続, 読み出し）の上限秒数。上の "timeout" は個々のHTTP通信の上限で、
+            # セグメントを飛ばしながら進む読み出し全体は止められないため別に設ける
+            timeout=(30, self.DOWNLOAD_STALL_TIMEOUT_SECONDS),
         )
         try:
             audio_stream = container.streams.audio[0]
@@ -385,13 +396,27 @@ class RadiruManager:
                             if on_progress is not None and packet_count % 100 == 0:
                                 on_progress(pts_counter * float(audio_stream.time_base), total_seconds)
                         break
+                    except av.error.ExitError:
+                        # DOWNLOAD_STALL_TIMEOUT_SECONDS のあいだ何も届かなかった
+                        raise RuntimeError(
+                            f"通信が{self.DOWNLOAD_STALL_TIMEOUT_SECONDS}秒以上途絶えたため中止しました"
+                        )
                     except av.FFmpegError:
                         demux_errors += 1
                         consecutive_demux_errors += 1
                         if consecutive_demux_errors >= self.MAX_CONSECUTIVE_DEMUX_ERRORS:
                             raise
+                done_seconds = pts_counter * float(audio_stream.time_base)
                 if on_progress is not None:
-                    on_progress(pts_counter * float(audio_stream.time_base), total_seconds)
+                    on_progress(done_seconds, total_seconds)
+                # 通信断で飛ばされたセグメントはエラーにならず、短いファイルがそのまま
+                # 「完了」になってしまう（実機で確認済み）。配信側の尺と突き合わせる
+                if (total_seconds is not None
+                        and done_seconds < total_seconds - self.DOWNLOAD_SHORTFALL_TOLERANCE_SECONDS):
+                    raise RuntimeError(
+                        "通信エラーにより音声が欠落しました"
+                        f"（{total_seconds:.0f}秒中{done_seconds:.0f}秒のみ取得）"
+                    )
                 logger.info(
                     f"聴き逃しダウンロード完了: {output_path} "
                     f"({packet_count}パケット, {skipped}件読み飛ばし, 読み出しエラー{demux_errors}回)"

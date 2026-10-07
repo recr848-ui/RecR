@@ -1068,6 +1068,23 @@ class RadikoManager:
                 return None
             delay = min(delay * 2, self.FETCH_RETRY_MAX_DELAY_SECONDS)
 
+    def _get_live_medialist_url(self, playlist_url, headers, stop_event):
+        """マスタープレイリストを取得し、そこに書かれたmedialist(session付)のURLを返す
+
+        Returns:
+            str または None: 停止要求があった場合は None
+        """
+        top_res = self._get_with_retry(
+            requests.get, playlist_url, stop_event, headers=headers, timeout=10
+        )
+        if top_res is None:
+            return None
+        top_res.raise_for_status()
+        return next(
+            line.strip() for line in top_res.text.splitlines()
+            if line.strip() and not line.startswith("#")
+        )
+
     def _iter_live_segments(self, playlist_url, headers, stop_event):
         """マスタープレイリストを起点に、ライブ配信の新規セグメント(生のAACバイト列)を
         順次生成するジェネレーター。
@@ -1075,25 +1092,35 @@ class RadikoManager:
         radikoのHLS配信は「マスタープレイリスト → メディアリスト(session付) → .aacセグメント」
         という構成。再生・録音の両方でこのジェネレーターを共有する。
         """
-        top_res = self._get_with_retry(
-            requests.get, playlist_url, stop_event, headers=headers, timeout=10
-        )
-        if top_res is None:
+        medialist_url = self._get_live_medialist_url(playlist_url, headers, stop_event)
+        if medialist_url is None:
             return
-        top_res.raise_for_status()
-        medialist_url = next(
-            line.strip() for line in top_res.text.splitlines()
-            if line.strip() and not line.startswith("#")
-        )
 
         last_sequence = -1
+        session_renewed = False
         while not stop_event.is_set():
             media_res = self._get_with_retry(
                 requests.get, medialist_url, stop_event, headers=headers, timeout=10
             )
             if media_res is None:
                 return
+            if 400 <= media_res.status_code < 500 and not session_renewed:
+                # 通信断が長引くと、その間にradiko側でセッションが期限切れになり、
+                # 復旧後のmedialistが404になる（実機で確認済み）。マスタープレイリスト
+                # からセッションを取り直して続行する。取り直した直後も4xxなら諦める
+                logger.warning(
+                    f"ライブ配信: medialistが{media_res.status_code}になったため、"
+                    "セッションを取り直します"
+                )
+                medialist_url = self._get_live_medialist_url(playlist_url, headers, stop_event)
+                if medialist_url is None:
+                    return
+                # 新しいセッションではシーケンス番号が引き継がれる保証がない
+                last_sequence = -1
+                session_renewed = True
+                continue
             media_res.raise_for_status()
+            session_renewed = False
 
             media_sequence = 0
             target_duration = 5.0
@@ -1236,18 +1263,24 @@ class RadikoManager:
             return sub_progress
 
         def worker(idx, sub_ft_dt, sub_to_dt):
-            lsid = uuid.uuid4().hex
-            ft_str = sub_ft_dt.strftime("%Y%m%d%H%M%S")
             to_str = sub_to_dt.strftime("%Y%m%d%H%M%S")
-            playlist_url = (
-                f"{playlist_base_url}?station_id={station_id}&start_at={ft_str}&ft={ft_str}"
-                f"&end_at={to_str}&to={to_str}&l=15&lsid={lsid}&type=b"
-            )
+
+            def build_playlist_url(from_dt):
+                # セッション（lsid）ごとに別のURLにする。通信断でセッションが切れた
+                # ときは、続きの時刻を from_dt にして同じ形で作り直す
+                lsid = uuid.uuid4().hex
+                ft_str = from_dt.strftime("%Y%m%d%H%M%S")
+                return (
+                    f"{playlist_base_url}?station_id={station_id}&start_at={ft_str}&ft={ft_str}"
+                    f"&end_at={to_str}&to={to_str}&l=15&lsid={lsid}&type=b"
+                )
+
             headers = {"X-Radiko-AuthToken": auth_token}
             try:
                 for chunk in self._iter_timefree_segments(
-                    playlist_url, headers, stop_event, sub_to_dt,
-                    on_progress=make_sub_progress(idx)
+                    build_playlist_url(sub_ft_dt), headers, stop_event, sub_to_dt,
+                    on_progress=make_sub_progress(idx),
+                    renew_playlist_url=build_playlist_url,
                 ):
                     result_queues[idx].put(("data", chunk))
             except Exception as e:
@@ -1279,7 +1312,13 @@ class RadikoManager:
             for t in threads:
                 t.join(timeout=5)
 
-    def _iter_timefree_segments(self, playlist_url, headers, stop_event, to_dt, on_progress=None):
+    # タイムフリーの取得がこの秒数以内まで to_dt に迫っていれば、medialistの404や
+    # 新規セグメントの枯渇を「番組の終わりに達した」とみなす。これより手前で
+    # 起きた場合は途中で切れたものとして扱う
+    TIMEFREE_END_TOLERANCE_SECONDS = 15
+
+    def _iter_timefree_segments(self, playlist_url, headers, stop_event, to_dt, on_progress=None,
+                                renew_playlist_url=None):
         """タイムフリープレイリストの全セグメント(生のAACバイト列)を順に生成するジェネレーター。
 
         タイムフリーのmedialistは、1回の取得ではプレイリストURLのl(秒数)パラメータ分の
@@ -1295,31 +1334,39 @@ class RadikoManager:
 
         セグメントの#EXT-X-PROGRAM-DATE-TIMEが to_dt に達したら終了する。
 
+        renew_playlist_url (callable または None): renew_playlist_url(ft_dt) の形で、
+        ft_dt から to_dt までを新しいセッションで取得するプレイリストURLを返す。
+        通信断でセッションが切れたとき、続きから取り直すのに使う（Noneなら取り直さず
+        例外にする）。
+
         on_progress (callable または None): on_progress(done, total_estimate) の形で
         セグメント取得のたびに呼ばれる進捗コールバック（total_estimateはft〜to間の
         推定セグメント数で、実際の総数とは多少ずれることがある）。バックグラウンドスレッドから
         呼ばれる。
         """
         session = requests.Session()
-        top_res = self._get_with_retry(
-            session.get, playlist_url, stop_event, headers=headers, timeout=10
-        )
-        if top_res is None:
-            return
-        top_res.raise_for_status()
 
-        if "#EXTINF" in top_res.text:
-            medialist_url = playlist_url
-        else:
-            medialist_url = next(
+        def open_session(url):
+            """プレイリストURLからmedialistのURLを得る（停止要求があった場合は None）"""
+            top_res = self._get_with_retry(
+                session.get, url, stop_event, headers=headers, timeout=10
+            )
+            if top_res is None:
+                return None
+            top_res.raise_for_status()
+            if "#EXTINF" in top_res.text:
+                return url
+            medialist = next(
                 line.strip() for line in top_res.text.splitlines()
                 if line.strip() and not line.startswith("#")
             )
             # マスタープレイリストが案内するmedialist URLは station_id と session パラメータの
             # みで ft/to/l を含まないため、元のプレイリストURLが持っていたものを引き継ぐ
-            medialist_url = self._carry_over_query_params(
-                playlist_url, medialist_url, ('ft', 'to', 'l')
-            )
+            return self._carry_over_query_params(url, medialist, ('ft', 'to', 'l'))
+
+        medialist_url = open_session(playlist_url)
+        if medialist_url is None:
+            return
 
         total_estimate = None
         last_sequence = -1
@@ -1327,6 +1374,15 @@ class RadikoManager:
         failed_count = 0
         stall_count = 0
         first_segment_dt = None
+        last_segment_dt = None
+        target_duration = 5.0
+        done_at_last_renewal = -1
+
+        def remaining_seconds():
+            """最後に取得したセグメントの終わりから to_dt までの秒数（不明なら None）"""
+            if last_segment_dt is None:
+                return None
+            return (to_dt - last_segment_dt).total_seconds() - target_duration
 
         while not stop_event.is_set():
             media_res = self._get_with_retry(
@@ -1335,14 +1391,33 @@ class RadikoManager:
             if media_res is None:
                 return
             if media_res.status_code == 404 and done > 0:
-                # CDN側のセッションには寿命があるらしく、番組の終端付近で
-                # medialistが404になることがある（実機で確認済み）。既にいくらか
-                # セグメントを取得できていれば、末尾まで到達したとみなして正常終了する。
-                logger.info(
-                    f"タイムフリー: medialistが404になりました（done={done}件）。"
-                    "セッション終了とみなして完了とします"
+                remaining = remaining_seconds()
+                if remaining is None or remaining <= self.TIMEFREE_END_TOLERANCE_SECONDS:
+                    # CDN側のセッションには寿命があるらしく、番組の終端付近で
+                    # medialistが404になることがある（実機で確認済み）。末尾まで
+                    # 到達していれば正常終了とする。
+                    logger.info(
+                        f"タイムフリー: medialistが404になりました（done={done}件）。"
+                        "セッション終了とみなして完了とします"
+                    )
+                    break
+                # 終端まで距離があるのに404＝通信断のあいだにセッションが期限切れに
+                # なった（実機で確認済み）。ここで完了扱いにすると、途中で切れた
+                # ファイルが「成功」になってしまうため、続きの時刻から取り直す。
+                # 取り直しても1件も進まないまま再び404なら諦める
+                if renew_playlist_url is None or done == done_at_last_renewal:
+                    media_res.raise_for_status()
+                logger.warning(
+                    f"タイムフリー: medialistが404になったため、続きからセッションを取り直します"
+                    f"（done={done}件、残り約{remaining:.0f}秒）"
                 )
-                break
+                done_at_last_renewal = done
+                resume_dt = last_segment_dt + timedelta(seconds=target_duration)
+                medialist_url = open_session(renew_playlist_url(resume_dt))
+                if medialist_url is None:
+                    return
+                last_sequence = -1
+                continue
             media_res.raise_for_status()
             media_sequence, target_duration, entries = self._parse_medialist(media_res.text)
 
@@ -1354,6 +1429,11 @@ class RadikoManager:
                         f"タイムフリー: {stall_count}回連続で新規セグメントを取得できず中断しました "
                         f"(last_sequence={last_sequence})"
                     )
+                    remaining = remaining_seconds()
+                    if remaining is not None and remaining > self.TIMEFREE_END_TOLERANCE_SECONDS:
+                        raise RuntimeError(
+                            f"タイムフリーの取得が途中で止まりました（残り約{remaining:.0f}秒）"
+                        )
                     return
                 if stop_event.is_set():
                     return
@@ -1365,6 +1445,12 @@ class RadikoManager:
             for seq, seg_url, dt_str in new_entries:
                 seg_dt = self._parse_program_date_time(dt_str)
                 is_last_segment = False
+                if (seg_dt is not None and last_segment_dt is not None
+                        and seg_dt <= last_segment_dt):
+                    # セッションを取り直した直後は、秒単位に丸めた開始時刻のせいで
+                    # 取得済みのセグメントがもう一度載ることがある
+                    last_sequence = seq
+                    continue
                 if seg_dt is not None:
                     if first_segment_dt is None:
                         first_segment_dt = seg_dt
@@ -1402,6 +1488,8 @@ class RadikoManager:
                         f"タイムフリーセグメント取得失敗: status={seg_res.status_code} url={seg_url}"
                     )
                 last_sequence = seq
+                if seg_dt is not None:
+                    last_segment_dt = seg_dt
                 done += 1
                 if on_progress and total_estimate:
                     on_progress(min(done, total_estimate), total_estimate)
