@@ -2118,8 +2118,16 @@ class RecRApp:
         tree.heading(col, command=lambda: self._sort_treeview_column(tree, col, not reverse))
 
     def _apply_treeview_sort(self, tree, col, reverse):
-        """Treeviewの行を、指定列の値で並べ替える"""
-        items = [(tree.set(item, col), item) for item in tree.get_children("")]
+        """Treeviewの行を、指定列の値で並べ替える
+
+        表示文字列のままでは正しく並ばない列（「980 KB」と「1.2 MB」が混じるサイズ列
+        など）は、tree._sort_keys に {列名: 行ID→比較用の値} を登録しておくとそちらを使う。
+        """
+        sort_key = getattr(tree, "_sort_keys", {}).get(col)
+        if sort_key is None:
+            def sort_key(item):
+                return tree.set(item, col)
+        items = [(sort_key(item), item) for item in tree.get_children("")]
         items.sort(key=lambda pair: pair[0], reverse=reverse)
         for index, (_, item) in enumerate(items):
             tree.move(item, "", index)
@@ -2186,15 +2194,16 @@ class RecRApp:
         list_frame = ttk.Frame(parent, padding=(10, 0, 10, 10))
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("enabled", "station", "schedule", "time", "title", "source", "status", "download")
+        # 日付と時刻は1つの列にまとめる（日付で並べ替えたとき、同じ日の中も時刻順に並ぶように）
+        columns = ("enabled", "station", "schedule", "title", "source", "status", "download")
         headings = {
-            "enabled": "有効", "station": "局", "schedule": "日付/繰り返し",
-            "time": "時刻", "title": "番組名", "source": "由来", "status": "状態",
+            "enabled": "有効", "station": "局", "schedule": "日時/繰り返し",
+            "title": "番組名", "source": "由来", "status": "状態",
             "download": "タイムフリー"
         }
         widths = {
-            "enabled": 36, "station": 90, "schedule": 120,
-            "time": 110, "title": 240, "source": 120, "status": 80, "download": 90
+            "enabled": 36, "station": 90, "schedule": 210,
+            "title": 240, "source": 120, "status": 100, "download": 90
         }
         # Ctrl/Shiftクリックで複数選択し、まとめて有効化・無効化・削除できるようにする
         tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
@@ -2226,6 +2235,7 @@ class RecRApp:
                 schedule_text = f"毎週{self.manager.WEEKDAY_JA[weekday]}曜日"
             else:
                 schedule_text = res.get('date_iso', '')
+            schedule_text = f"{schedule_text} {res.get('start', '')}-{res.get('end', '')}"
 
             if self.manager.is_recording_active(res.get('station'), reservation_id=res.get('id')):
                 status_text = "録音中"
@@ -2237,6 +2247,10 @@ class RecRApp:
                 status_text = "中断（一部のみ）"
             elif res.get('last_result') == 'failed':
                 status_text = "失敗"
+            elif res.get('repeat') != 'weekly' and self._reservation_is_overdue_pending(res):
+                # 放送時刻を過ぎたのに一度も実行されていない（その時刻にアプリが動いて
+                # いなかった等）。毎週の予約は次回を待っている状態でもあるので対象外
+                status_text = "未実行"
             else:
                 status_text = "待機中"
 
@@ -2254,7 +2268,6 @@ class RecRApp:
                     "○" if res.get('enabled', True) else "×",
                     res.get('station', ''),
                     schedule_text,
-                    f"{res.get('start', '')}-{res.get('end', '')}",
                     res.get('title', ''),
                     source_text,
                     status_text,
@@ -2669,6 +2682,9 @@ class RecRApp:
 
         self.files_tree = tree
         self._files_row_map = {}
+        # サイズ列は「KB」「MB」の表示が混じるため、バイト数で並べ替える
+        self._files_row_sizes = {}
+        tree._sort_keys = {"size": lambda item: self._files_row_sizes.get(item, 0)}
         self._refresh_files_list()
 
     def _refresh_files_list(self):
@@ -2677,6 +2693,7 @@ class RecRApp:
         view = self._capture_treeview_view(tree, self._files_row_map)
         tree.delete(*tree.get_children())
         self._files_row_map = {}
+        self._files_row_sizes = {}
 
         output_dir = self.manager.output_dir
         self.files_dir_label.configure(text=f"保存先: {output_dir}")
@@ -2696,6 +2713,7 @@ class RecRApp:
             size_text = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB"
             item_id = tree.insert("", tk.END, values=(f.name, modified, size_text))
             self._files_row_map[item_id] = f
+            self._files_row_sizes[item_id] = stat.st_size
         self._restore_treeview_view(tree, self._files_row_map, view)
 
     def _get_selected_files(self):

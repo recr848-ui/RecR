@@ -699,3 +699,46 @@ def test_reservation_resume_backs_off_and_stops_when_reservation_deleted(app, mo
     app._resume_reservation_recording(reservation["id"], occurrence, end_dt)
     assert calls == []
     assert app._reservation_resume_state == {}
+
+
+def test_reservation_list_shows_overdue_unrun_and_merged_datetime(app, monkeypatch):
+    """放送時刻を過ぎて一度も実行されていない単発予約は「待機中」ではなく「未実行」と表示し、
+    日付と時刻は1つの列にまとめる"""
+    past = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+    future = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+    reservations = [
+        {'id': 'past', 'station': 'A', 'repeat': 'once', 'date_iso': past,
+         'start': '21:05', 'end': '21:55', 'title': 'p', 'enabled': True, 'last_run_date': None},
+        {'id': 'future', 'station': 'A', 'repeat': 'once', 'date_iso': future,
+         'start': '21:05', 'end': '21:55', 'title': 'f', 'enabled': True, 'last_run_date': None},
+        {'id': 'weekly', 'station': 'A', 'repeat': 'weekly',
+         'weekday': (datetime.now() - timedelta(days=2)).weekday(),
+         'start': '21:05', 'end': '21:55', 'title': 'w', 'enabled': True, 'last_run_date': None},
+    ]
+    monkeypatch.setattr(app.manager, "load_reservations", lambda: reservations)
+
+    app._refresh_reservation_list()
+
+    tree = app.reservation_tree
+    rows = {app._reservation_row_map[item]: tree.set(item) for item in tree.get_children("")}
+    assert rows['past']['status'] == "未実行"
+    assert rows['future']['status'] == "待機中"
+    assert rows['weekly']['status'] == "待機中"
+    assert rows['past']['schedule'] == f"{past} 21:05-21:55"
+    assert rows['weekly']['schedule'].endswith("曜日 21:05-21:55")
+    assert "time" not in tree["columns"]
+
+
+def test_files_list_sorts_size_column_by_bytes(app, tmp_path):
+    """サイズ列は表示文字列（「980 KB」「1.2 MB」）ではなくバイト数で並べ替える"""
+    app.manager.output_dir = tmp_path
+    for name, size in (("a.mp3", 980 * 1024), ("b.mp3", 1200 * 1024), ("c.mp3", 20 * 1024)):
+        (tmp_path / name).write_bytes(b"\0" * size)
+    app._refresh_files_list()
+
+    tree = app.files_tree
+    app._sort_treeview_column(tree, "size", False)
+    assert [tree.set(item, "name") for item in tree.get_children("")] == ["c.mp3", "a.mp3", "b.mp3"]
+
+    app._sort_treeview_column(tree, "size", True)
+    assert [tree.set(item, "name") for item in tree.get_children("")] == ["b.mp3", "a.mp3", "c.mp3"]
