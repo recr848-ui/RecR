@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import calendar
 import ctypes
+import faulthandler
 import hashlib
 import io
 import json
@@ -20,6 +21,7 @@ import os
 import re
 import sys
 import threading
+import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,7 +41,7 @@ _URL_PATTERN = re.compile(r'https?://[^\s"\'<>]+')
 # 親ディレクトリをパスに追加してインポート
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.app_logger import setup_logging
+from utils.app_logger import LOG_DIR, setup_logging
 from utils.paths import get_base_dir
 from utils.radiko_manager import RadikoManager, keyword_matches
 from utils.radiru_manager import RadiruManager
@@ -4739,6 +4741,67 @@ def _install_exception_logging(root):
     sys.excepthook = log_uncaught_exception
 
 
+# 画面が固まったときのスタックの書き出し先（recr.log とは別ファイル）
+FREEZE_TRACE_FILE = LOG_DIR / "freeze_trace.log"
+FREEZE_TRACE_MAX_BYTES = 1024 * 1024
+# メインループがこの秒数応答しなければ「固まった」とみなす。確認ダイアログの表示中も
+# メインループは回り続けるため、通常の操作でこの時間を超えることはない
+FREEZE_TIMEOUT_SECONDS = 60
+FREEZE_HEARTBEAT_INTERVAL_MS = 5000
+
+
+def _install_freeze_trace(root):
+    """画面（メインループ）が固まったとき、全スレッドのスタックをファイルに書き出すようにする
+
+    固まった場合は例外が出ないため recr.log には何も残らず、後から原因を追えない。
+    メインループから定期的に「FREEZE_TIMEOUT_SECONDS 秒後にスタックを書き出す」予約を
+    入れ直し続けることで、メインループが止まったときだけ予約が実行されるようにする。
+
+    書き出しは faulthandler が持つPythonの外側のスレッドが行うため、ネイティブコードが
+    GILを握ったまま止まってPython全体が動けなくなっている場合でも記録が残る
+    （Pythonのスレッドで監視する方式では、その場合に監視側も止まってしまう）。
+    同じファイルに、異常終了（アクセス違反等）時のスタックも書き出す。
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if (FREEZE_TRACE_FILE.exists()
+                and FREEZE_TRACE_FILE.stat().st_size > FREEZE_TRACE_MAX_BYTES):
+            FREEZE_TRACE_FILE.unlink()
+        # faulthandler がファイル記述子を直接使うため、アプリ終了まで開いたままにする
+        trace_file = open(FREEZE_TRACE_FILE, "a", encoding="utf-8")
+        faulthandler.enable(file=trace_file, all_threads=True)
+    except Exception:
+        logger.exception("フリーズ時のスタック記録を有効にできませんでした")
+        return
+
+    last_beat = time.monotonic()
+
+    def beat():
+        nonlocal last_beat
+        now = time.monotonic()
+        stalled = now - last_beat
+        last_beat = now
+        try:
+            if stalled >= FREEZE_TIMEOUT_SECONDS:
+                # faulthandler の出力には時刻が入らないため、復帰できた場合はここで補う
+                # （復帰しなかった場合は、ファイルの更新日時が固まった時刻の目安になる）。
+                # PCのスリープからの復帰直後にも出ることがある
+                message = (
+                    f"メインループが約{stalled:.0f}秒応答していませんでした"
+                    f"（{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} に復帰）"
+                )
+                logger.warning(f"{message}。スタックは {FREEZE_TRACE_FILE.name} を参照")
+                trace_file.write(f"--- {message} ---\n\n")
+                trace_file.flush()
+            # 予約を入れ直す（前回の予約は取り消される）
+            faulthandler.dump_traceback_later(FREEZE_TIMEOUT_SECONDS, file=trace_file)
+        except Exception:
+            logger.exception("フリーズ監視の更新でエラーが発生しました")
+        root.after(FREEZE_HEARTBEAT_INTERVAL_MS, beat)
+
+    beat()
+
+
 def main():
     if not _acquire_single_instance_lock():
         root = tk.Tk()
@@ -4754,7 +4817,9 @@ def main():
     root = tk.Tk()
     _install_exception_logging(root)
     app = RecRApp(root)
+    _install_freeze_trace(root)
     root.mainloop()
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
