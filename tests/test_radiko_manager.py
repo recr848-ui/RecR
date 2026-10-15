@@ -725,6 +725,62 @@ def test_iter_timefree_segments_treats_404_near_the_end_as_complete(manager, mon
     assert segments == [b"193000", b"193005", b"193010", b"193015"]
 
 
+def _install_stalling_timefree_server(monkeypatch, segment_count):
+    """medialistが毎回同じ segment_count 件（5秒刻み）だけを返し、それ以上進まない配信"""
+    import utils.radiko_manager as radiko_manager
+
+    def fake_get(url, headers=None, timeout=None):
+        if "/playlist" in url:
+            return _FakeResponse(text="#EXTM3U\nhttp://x/medialist?session=1\n")
+        if "/medialist" in url:
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:5", "#EXT-X-MEDIA-SEQUENCE:0"]
+            for i in range(segment_count):
+                seg_dt = _TF_BASE + timedelta(seconds=5 * i)
+                lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{seg_dt.isoformat()}+09:00")
+                lines.append(f"http://x/seg/{seg_dt:%H%M%S}")
+            return _FakeResponse(text="\n".join(lines) + "\n")
+        return _FakeResponse(content=url.rsplit("/", 1)[1].encode())
+
+    class FakeSession:
+        get = staticmethod(fake_get)
+
+    monkeypatch.setattr(radiko_manager.requests, "Session", FakeSession)
+    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+
+
+def test_iter_timefree_segments_stall_at_the_end_is_logged_as_info(manager, monkeypatch, caplog):
+    """終端付近まで取り終えてから新規セグメントが来なくなったのは正常終了。警告は出さない"""
+    import logging
+
+    _install_stalling_timefree_server(monkeypatch, segment_count=6)
+    with caplog.at_level(logging.INFO, logger="utils.radiko_manager"):
+        segments = list(manager._iter_timefree_segments(
+            _tf_playlist_url(_TF_BASE), {}, _InstantEvent(), _TF_BASE + timedelta(seconds=40),
+        ))
+
+    assert len(segments) == 6
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("区間の終わりまで取得しました" in r.getMessage() for r in caplog.records)
+
+
+def test_iter_timefree_segments_stall_in_the_middle_warns_and_fails(manager, monkeypatch, caplog):
+    import logging
+
+    import pytest
+
+    _install_stalling_timefree_server(monkeypatch, segment_count=6)
+    with caplog.at_level(logging.INFO, logger="utils.radiko_manager"):
+        with pytest.raises(RuntimeError):
+            list(manager._iter_timefree_segments(
+                _tf_playlist_url(_TF_BASE), {}, _InstantEvent(), _TF_BASE + timedelta(seconds=120),
+            ))
+
+    assert any(
+        r.levelno == logging.WARNING and "新規セグメントを取得できず" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 # --- 番組画像のディスクキャッシュ ------------------------------------------------
 
 def test_prune_image_cache_removes_oldest_until_under_limit(manager, monkeypatch):

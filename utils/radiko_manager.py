@@ -1549,15 +1549,20 @@ class RadikoManager:
             if not new_entries:
                 stall_count += 1
                 if stall_count >= 10:
-                    logger.warning(
-                        f"タイムフリー: {stall_count}回連続で新規セグメントを取得できず中断しました "
-                        f"(last_sequence={last_sequence})"
-                    )
                     remaining = remaining_seconds()
                     if remaining is not None and remaining > self.TIMEFREE_END_TOLERANCE_SECONDS:
+                        logger.warning(
+                            f"タイムフリー: {stall_count}回連続で新規セグメントを取得できず中断しました "
+                            f"(last_sequence={last_sequence}、残り約{remaining:.0f}秒)"
+                        )
                         raise RuntimeError(
                             f"タイムフリーの取得が途中で止まりました（残り約{remaining:.0f}秒）"
                         )
+                    # 区間の終わりまで取り終えた後、続きが無いことを確かめて抜けただけ（正常終了）
+                    logger.info(
+                        f"タイムフリー: 区間の終わりまで取得しました（以降の新規セグメントなし、"
+                        f"last_sequence={last_sequence}）"
+                    )
                     return
                 if stop_event.is_set():
                     return
