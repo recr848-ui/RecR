@@ -801,3 +801,171 @@ def test_write_json_atomic_falls_back_to_direct_write_when_replace_keeps_failing
 
     assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+# --- scan_freewords_for_station ------------------------------------------
+
+_FW_STATION = "NHK FM（東京）"
+
+
+def _fw_date(days=2):
+    return (datetime.now() + timedelta(days=days)).date().isoformat()
+
+
+def _fw_program(date_iso, start, end, title):
+    return {"date_iso": date_iso, "start": start, "end": end, "title": title, "desc": "", "pfm": ""}
+
+
+def _fw_setup(manager, keyword="マイ・フェイバリット・アルバム"):
+    return manager.add_freeword({"keyword": keyword, "stations": [_FW_STATION]})
+
+
+def _fw_reservations(manager):
+    return [r for r in manager.load_reservations() if r.get("station") == _FW_STATION]
+
+
+def test_scan_freewords_creates_one_reservation_per_slot(manager):
+    _fw_setup(manager)
+    day = _fw_date()
+    programs = [
+        _fw_program(day, "18:00", "18:50", "マイ・フェイバリット・アルバム　９月１日"),
+        _fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム"),
+        _fw_program(day, "21:45", "22:30", "ミュージックライン"),
+    ]
+    assert len(manager.scan_freewords_for_station(_FW_STATION, programs)) == 2
+    assert manager.scan_freewords_for_station(_FW_STATION, programs) == []
+    assert sorted(r["start"] for r in _fw_reservations(manager)) == ["18:00", "22:30"]
+
+
+def test_scan_freewords_updates_title_instead_of_adding_when_subtitle_appears(manager):
+    """NHKは放送が近づくと副題が付く。同じ枠に2件目を作らず、番組名を書き換える"""
+    _fw_setup(manager)
+    day = _fw_date()
+    manager.scan_freewords_for_station(
+        _FW_STATION, [_fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム")]
+    )
+    manager.scan_freewords_for_station(
+        _FW_STATION, [_fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム　選　９月３日")]
+    )
+    reservations = _fw_reservations(manager)
+    assert len(reservations) == 1
+    assert reservations[0]["title"] == "マイ・フェイバリット・アルバム　選　９月３日"
+
+
+def test_scan_freewords_moves_reservation_when_program_time_changes(manager):
+    """時刻が変わった回は、古い枠の予約を消して新しい枠に作り直す
+    （古い枠の予約が残ると、先に局を使って新しい枠が録れなくなる）"""
+    _fw_setup(manager)
+    day = _fw_date()
+    other = _fw_program(day, "06:00", "07:00", "別の番組")
+    manager.scan_freewords_for_station(
+        _FW_STATION, [other, _fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム")]
+    )
+    manager.scan_freewords_for_station(
+        _FW_STATION, [other, _fw_program(day, "22:40", "23:30", "マイ・フェイバリット・アルバム")]
+    )
+    assert [(r["start"], r["end"]) for r in _fw_reservations(manager)] == [("22:40", "23:30")]
+
+
+def test_scan_freewords_keeps_reservations_outside_fetched_range(manager):
+    """番組表の取得範囲外（取れた日より先）の予約は、一致する番組が無くても消さない"""
+    _fw_setup(manager)
+    far = _fw_date(days=8)
+    near = _fw_date(days=2)
+    manager.scan_freewords_for_station(
+        _FW_STATION, [_fw_program(far, "22:30", "23:20", "マイ・フェイバリット・アルバム")]
+    )
+    manager.scan_freewords_for_station(
+        _FW_STATION, [_fw_program(near, "06:00", "07:00", "別の番組")]
+    )
+    assert [r["date_iso"] for r in _fw_reservations(manager)] == [far]
+
+
+def test_scan_freewords_does_not_touch_run_or_manual_or_disabled_keyword_reservations(manager):
+    _fw_setup(manager)
+    day = _fw_date()
+    run = manager.add_reservation({
+        "station": _FW_STATION, "repeat": "once", "date_iso": day, "start": "18:00", "end": "18:50",
+        "title": "古い名前", "source": "freeword", "keyword_id": "deleted-keyword",
+    })
+    manual = manager.add_reservation({
+        "station": _FW_STATION, "repeat": "once", "date_iso": day, "start": "22:30", "end": "23:20",
+        "title": "手動で入れた予約",
+    })
+    programs = [
+        _fw_program(day, "06:00", "07:00", "別の番組"),
+        _fw_program(day, "18:00", "18:50", "マイ・フェイバリット・アルバム"),
+        _fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム"),
+    ]
+    assert manager.scan_freewords_for_station(_FW_STATION, programs) == []
+    assert manager.get_reservation(run["id"])["title"] == "古い名前"
+    assert manager.get_reservation(manual["id"])["title"] == "手動で入れた予約"
+    assert len(_fw_reservations(manager)) == 2
+
+
+def test_scan_freewords_skips_slot_covered_by_weekly_reservation(manager):
+    _fw_setup(manager)
+    day = _fw_date()
+    weekday = datetime.strptime(day, "%Y-%m-%d").weekday()
+    manager.add_reservation({
+        "station": _FW_STATION, "repeat": "weekly", "weekday": weekday,
+        "start": "22:30", "end": "23:20", "title": "毎週",
+    })
+    manager.scan_freewords_for_station(
+        _FW_STATION, [_fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム")]
+    )
+    assert [r["repeat"] for r in _fw_reservations(manager)] == ["weekly"]
+
+
+def test_scan_freewords_removes_existing_duplicates_in_same_slot(manager):
+    """以前の版で番組名違いのまま同じ枠に作られていた重複を、1件にまとめる"""
+    freeword = _fw_setup(manager)
+    day = _fw_date()
+    for title in ("マイ・フェイバリット・アルバム", "マイ・フェイバリット・アルバム　選　９月３日"):
+        manager.add_reservation({
+            "station": _FW_STATION, "repeat": "once", "date_iso": day, "start": "22:30", "end": "23:20",
+            "title": title, "source": "freeword", "keyword_id": freeword["id"],
+        })
+    manager.scan_freewords_for_station(
+        _FW_STATION, [_fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム　選　９月３日")]
+    )
+    reservations = _fw_reservations(manager)
+    assert len(reservations) == 1
+    assert reservations[0]["title"] == "マイ・フェイバリット・アルバム　選　９月３日"
+
+
+def test_scan_freewords_from_parallel_threads_does_not_duplicate(manager):
+    import threading
+
+    _fw_setup(manager)
+    day = _fw_date()
+    programs = [_fw_program(day, "22:30", "23:20", "マイ・フェイバリット・アルバム")]
+    barrier = threading.Barrier(4)
+
+    def scan():
+        barrier.wait()
+        manager.scan_freewords_for_station(_FW_STATION, programs)
+
+    threads = [threading.Thread(target=scan) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(_fw_reservations(manager)) == 1
+
+
+def test_get_due_reservations_logs_missed_start_once(manager, caplog):
+    import logging
+
+    now = datetime.now()
+    if (now - timedelta(minutes=10)).date() != now.date() or (now + timedelta(minutes=30)).date() != now.date():
+        pytest.skip("日付をまたぐ時間帯は対象外")
+    manager.add_reservation({
+        "station": "NHK-FM", "repeat": "once", "date_iso": now.date().isoformat(),
+        "start": (now - timedelta(minutes=10)).strftime("%H:%M"),
+        "end": (now + timedelta(minutes=30)).strftime("%H:%M"), "title": "始まらなかった番組",
+    })
+    with caplog.at_level(logging.WARNING, logger="utils.radiko_manager"):
+        assert manager.get_due_reservations() == []
+        manager.get_due_reservations()
+    assert len([r for r in caplog.records if "始まらなかった番組" in r.getMessage()]) == 1

@@ -174,6 +174,15 @@ class RecRApp:
         # 一部でも録音できたか}。開始失敗・途中中断した予約録音を番組終了まで再開し続ける
         # ための状態（_schedule_reservation_resume）
         self._reservation_resume_state = {}
+        # 局が使用中で開始を見送った (予約ID, 対象日)。ログを1回だけ出すため
+        self._busy_skip_logged = set()
+        # 取り逃した予約の自動取得（_run_missed_reservation_recovery）の状態
+        self.auto_recover_missed_var = tk.BooleanVar(value=settings.get('auto_recover_missed', True))
+        self._missed_recovery_in_progress = False
+        self._missed_recovery_job = None
+        # 予約チェックの巡回を最後に実行した時刻。間隔が大きく空いたら、スリープや
+        # 応答なしで止まっていたとみなして取り逃しの回収を前倒しする
+        self._last_reservation_check_at = None
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_button)
         self._refresh_stale_stations()
@@ -184,6 +193,8 @@ class RecRApp:
         self._check_full_schedule_refresh_due()
         self._check_radiru_index_refresh_due()
         self.root.after(1500, self._notify_missed_reservations_on_startup)
+        # 起動直後は番組表の自動更新などと重ならないよう少し待ってから始める
+        self._missed_recovery_job = self.root.after(60 * 1000, self._schedule_missed_reservation_recovery)
         self._refresh_notice()
 
     def on_close_button(self):
@@ -312,6 +323,9 @@ class RecRApp:
         if self._full_refresh_check_job:
             self.root.after_cancel(self._full_refresh_check_job)
             self._full_refresh_check_job = None
+        if self._missed_recovery_job:
+            self.root.after_cancel(self._missed_recovery_job)
+            self._missed_recovery_job = None
         self.manager.stop_playback()
         self.manager.stop_recording()
         self.manager.stop_all_downloads()
@@ -672,6 +686,10 @@ class RecRApp:
         settings_menu.add_checkbutton(
             label="予約待機中・録音中は自動スリープを抑止する",
             variable=self.prevent_sleep_var, command=self._on_prevent_sleep_changed
+        )
+        settings_menu.add_checkbutton(
+            label="取り逃した予約をタイムフリー・聴き逃しで自動取得する",
+            variable=self.auto_recover_missed_var, command=self._on_auto_recover_missed_changed
         )
 
         settings_menu.add_separator()
@@ -2314,6 +2332,10 @@ class RecRApp:
             r for r in self.manager.load_reservations()
             if self._reservation_needs_timefree_recovery(r)
         ]
+        if self.auto_recover_missed_var.get():
+            # 自動取得の対象になるもの（これから試すもの）は知らせず、
+            # 自動取得を諦めたもの・期限切れのものだけを知らせる
+            missed = [r for r in missed if self._missed_recovery_plan(r) is None]
         if not missed:
             return
         message = (
@@ -2324,6 +2346,239 @@ class RecRApp:
             self._notify_via_tray("予約録音", message)
         else:
             messagebox.showinfo("予約録音", message)
+
+    # 取り逃した予約の自動取得: 巡回間隔、放送終了から取得を試み始めるまでの待ち時間、
+    # 1回分の放送について試みる回数の上限（NHKの再放送枠のように聴き逃しに載らない
+    # 回もあるため、いつまでも試し続けない）
+    MISSED_RECOVERY_INTERVAL_MS = 30 * 60 * 1000
+    MISSED_RECOVERY_DELAY_SECONDS = 15 * 60
+    MISSED_RECOVERY_MAX_ATTEMPTS = 8
+    # タイムフリー・聴き逃しで取得できる、放送終了からの期間
+    MISSED_RECOVERY_WINDOW = timedelta(days=7)
+    # 予約チェックの巡回がこれ以上空いたら、スリープや応答なしで止まっていたとみなす
+    RESERVATION_CHECK_GAP_SECONDS = 5 * 60
+
+    def _missed_recovery_plan(self, reservation, now=None):
+        """取り逃した予約を自動取得の対象にするかを判定する
+
+        Returns:
+            dict または None: 対象なら {'program', 'start_dt', 'end_dt', 'occurrence',
+            'attempts', 'ready'}（'ready' は放送終了から十分経ち、今すぐ試みてよいか）。
+            取り逃していない・期限切れ・試行回数の上限に達した場合は None
+        """
+        now = now or datetime.now()
+        if not self._reservation_needs_timefree_recovery(reservation):
+            return None
+        program = self._reservation_occurrence_program_dict(reservation)
+        if program is None:
+            return None
+        start_dt, end_dt = self._program_air_window(program)
+        if start_dt is None or end_dt is None:
+            return None
+        occurrence = start_dt.date().isoformat()
+        # 失敗・中断の記録が別の回（毎週予約の先週分など）のものなら対象外
+        if reservation.get('last_result') in ('failed', 'partial') and reservation.get('last_run_date') != occurrence:
+            return None
+        if now - end_dt > self.MISSED_RECOVERY_WINDOW:
+            return None
+        state = reservation.get('auto_recovery') or {}
+        attempts = state.get('attempts', 0) if state.get('occurrence') == occurrence else 0
+        if attempts >= self.MISSED_RECOVERY_MAX_ATTEMPTS:
+            return None
+        return {
+            'program': program, 'start_dt': start_dt, 'end_dt': end_dt,
+            'occurrence': occurrence, 'attempts': attempts,
+            'ready': now >= end_dt + timedelta(seconds=self.MISSED_RECOVERY_DELAY_SECONDS),
+        }
+
+    def _schedule_missed_reservation_recovery(self):
+        """取り逃した予約の自動取得を一定間隔で試みる（例外が起きても再スケジュールする）"""
+        try:
+            self._run_missed_reservation_recovery()
+        except Exception:
+            logger.exception("取り逃した予約の自動取得でエラーが発生しました")
+        self._missed_recovery_job = self.root.after(
+            self.MISSED_RECOVERY_INTERVAL_MS, self._schedule_missed_reservation_recovery
+        )
+
+    def _on_auto_recover_missed_changed(self):
+        """設定メニューの「取り逃した予約を自動取得する」切り替え時の保存処理"""
+        enabled = self.auto_recover_missed_var.get()
+        self.manager.save_settings({'auto_recover_missed': enabled})
+        if enabled:
+            self._run_missed_reservation_recovery()
+
+    def _run_missed_reservation_recovery(self):
+        """取り逃した予約（失敗・中断・実行されなかった待機中）を、radikoの
+        タイムフリー（NHKは聴き逃し配信）で自動的に取得する
+
+        アプリが止まっていた・PCがスリープしていた間の回を、次に動き出したときに
+        回収するためのもの。起動直後・一定間隔・予約チェックの巡回が大きく空いた
+        直後（スリープ復帰など）に呼ばれる。放送終了から少し待ってから試み、
+        取得できなければ次の巡回で再び試みる（1回分の放送につき上限回数まで）。
+        通信を伴うためバックグラウンドスレッドで1件ずつ処理する。
+        """
+        if not self.auto_recover_missed_var.get() or self._missed_recovery_in_progress:
+            return
+        now = datetime.now()
+        file_format = self.format_var.get()
+        try:
+            mp3_bitrate = int(self.bitrate_var.get())
+        except ValueError:
+            mp3_bitrate = 192
+        filename_pattern = self.filename_pattern_var.get()
+
+        targets = []
+        for reservation in self.manager.load_reservations():
+            plan = self._missed_recovery_plan(reservation, now=now)
+            if plan is None or not plan['ready']:
+                continue
+            station = reservation.get('station')
+            title = reservation.get('title') or station
+            plan.update({
+                'reservation_id': reservation['id'],
+                'station': station,
+                'title': title,
+                'metadata': self._build_recording_metadata(
+                    station, program=plan['program'], fallback_title=title
+                ),
+            })
+            targets.append(plan)
+        if not targets:
+            return
+
+        self._missed_recovery_in_progress = True
+        threading.Thread(
+            target=self._missed_recovery_worker,
+            args=(targets, file_format, mp3_bitrate, filename_pattern),
+            daemon=True,
+        ).start()
+
+    def _missed_recovery_worker(self, targets, file_format, mp3_bitrate, filename_pattern):
+        """_run_missed_reservation_recovery のバックグラウンドスレッド本体"""
+        try:
+            for target in targets:
+                try:
+                    self._recover_missed_reservation(target, file_format, mp3_bitrate, filename_pattern)
+                except Exception as e:
+                    logger.exception(f"取り逃した予約の自動取得に失敗しました: {target['station']} {target['title']}")
+                    self.root.after(0, self._on_missed_recovery_finished, target, None, False, str(e))
+        finally:
+            self.root.after(0, self._on_missed_recovery_worker_done)
+
+    def _on_missed_recovery_worker_done(self):
+        self._missed_recovery_in_progress = False
+
+    def _recover_missed_reservation(self, target, file_format, mp3_bitrate, filename_pattern):
+        """取り逃した予約1件を取得する（バックグラウンドスレッドから呼ばれる）
+
+        radikoのタイムフリーは取得を開始したら戻る（完了は on_complete で通知される）。
+        NHK聴き逃しはこのスレッド内でダウンロードし終えるまで戻らない。
+        """
+        station, title = target['station'], target['title']
+        start_dt, end_dt = target['start_dt'], target['end_dt']
+        ft = start_dt.strftime("%Y%m%d%H%M%S")
+
+        if self._is_nhk_station(station):
+            key = f"{station}|radiru|{ft}"
+        else:
+            key = f"{station}|{ft}"
+            if self.manager.is_download_active(station, ft):
+                return
+            if self.manager.is_download_limit_reached():
+                # 試行回数は数えずに、次の巡回で改めて試みる
+                logger.info(f"タイムフリーの同時ダウンロード数が上限のため、自動取得を次回に回します: {station} {title}")
+                return
+
+        attempts = target['attempts'] + 1
+        self.manager.update_reservation(target['reservation_id'], {
+            'auto_recovery': {'occurrence': target['occurrence'], 'attempts': attempts}
+        })
+        target['attempts'] = attempts
+        logger.info(
+            f"取り逃した予約を自動取得します（{attempts}/{self.MISSED_RECOVERY_MAX_ATTEMPTS}回目）: "
+            f"{station} {start_dt.strftime('%Y-%m-%d %H:%M')} {title}"
+        )
+
+        if self._is_nhk_station(station):
+            self._recover_missed_reservation_via_radiru(target, key, ft, filename_pattern)
+            return
+
+        self.root.after(0, self._register_active_download, key, station, ft, title)
+        success, output_path = self.manager.start_timefree_download(
+            station, ft, end_dt.strftime("%Y%m%d%H%M%S"),
+            file_format=file_format, mp3_bitrate=mp3_bitrate,
+            title=title, filename_pattern=filename_pattern, metadata=target['metadata'],
+            on_progress=lambda done, total, k=key: self.root.after(
+                0, self._update_active_download_progress, k, done, total
+            ),
+            on_complete=lambda had_data, path, error, k=key, t=target: self.root.after(
+                0, self._on_missed_recovery_finished, t, k, had_data and not error, error
+            ),
+        )
+        if not success:
+            self.root.after(0, self._on_missed_recovery_finished, target, key, False, "タイムフリーの取得を開始できませんでした")
+
+    def _recover_missed_reservation_via_radiru(self, target, key, ft, filename_pattern):
+        """NHKの取り逃した予約を、らじる★らじるの聴き逃し配信から取得する
+        （バックグラウンドスレッドから呼ばれる）"""
+        station, title = target['station'], target['title']
+        start_dt, end_dt = target['start_dt'], target['end_dt']
+        entry = self.radiru_manager.find_series_for_program(
+            self._nhk_radio_broadcast_code(station), title, None
+        )
+        if entry is None:
+            self.root.after(0, self._on_missed_recovery_finished, target, None, False,
+                            "NHK聴き逃しのインデックスに番組が見つかりません")
+            return
+        episodes = self.radiru_manager.fetch_series_episodes(entry['series_site_id'], entry['corner_site_id'])
+        episode = self.radiru_manager.find_episode_for_date(episodes, start_dt, end_dt)
+        stream_url = episode.get('stream_url') if episode else None
+        if not stream_url:
+            # 再放送の枠（聴き逃しは本放送のみ）や、まだ配信が始まっていない回
+            self.root.after(0, self._on_missed_recovery_finished, target, None, False,
+                            "NHK聴き逃しに該当する回がありません")
+            return
+
+        filename = self.manager.build_recording_filename(filename_pattern, station, title, start_dt, "m4a")
+        output_path = self.manager.unique_output_path(self.manager.output_dir / filename)
+        self.root.after(0, self._register_active_download, key, station, ft, title)
+        error = None
+        try:
+            self.radiru_manager.download_episode(
+                stream_url, output_path,
+                on_progress=lambda done, total, k=key: self.root.after(
+                    0, self._update_active_download_progress, k, done, total
+                ),
+            )
+            self.manager.write_metadata_tags(output_path, "m4a", target['metadata'])
+        except Exception as e:
+            logger.exception(f"NHK聴き逃しの自動取得に失敗しました ({title})")
+            error = str(e)
+        self.root.after(0, self._on_missed_recovery_finished, target, key, error is None, error)
+
+    def _on_missed_recovery_finished(self, target, key, success, error):
+        """取り逃した予約1件の自動取得の結果を反映する（メインスレッドから呼ばれる）"""
+        if key is not None:
+            self._unregister_active_download(key)
+            if hasattr(self, 'files_tree'):
+                self._refresh_files_list()
+        station, title = target['station'], target['title']
+        when = target['start_dt'].strftime('%m/%d %H:%M')
+        if success:
+            logger.info(f"取り逃した予約を自動取得しました: {station} {when} {title}")
+            self._mark_reservation_timefree_downloaded(target['reservation_id'])
+            if self._tray_icon is not None:
+                self._notify_via_tray("予約録音", f"取り逃した「{title}」（{when}放送）を自動取得しました。")
+            return
+
+        logger.info(f"取り逃した予約の自動取得に失敗しました: {station} {when} {title}（{error}）")
+        if target['attempts'] >= self.MISSED_RECOVERY_MAX_ATTEMPTS:
+            logger.warning(f"取り逃した予約の自動取得を諦めました: {station} {when} {title}")
+            if self._tray_icon is not None:
+                self._notify_via_tray(
+                    "予約録音", f"取り逃した「{title}」（{when}放送）を自動取得できませんでした。"
+                )
 
     def _on_reservation_tree_click(self, event):
         """予約一覧のクリック処理: 「タイムフリー」列のクリックのみ、対象予約の
@@ -3143,18 +3398,15 @@ class RecRApp:
                 'end': end,
                 'title': title_var.get().strip(),
             }
+            if existing and existing.get('source') == 'freeword':
+                # フリーワード由来の予約をダイアログで編集したら、以後は手動管理の
+                # 予約として扱う。フリーワード由来のままだと、番組表の更新のたびに
+                # 番組名・終了時刻が番組表の値に戻されたり、時刻を変えた枠に一致する
+                # 番組が無いとして削除されたりする（scan_freewords_for_station）
+                new_data['source'] = None
+                new_data['keyword_id'] = None
             if repeat_var.get() == 'weekly':
                 new_data['weekday'] = list(self.manager.WEEKDAY_JA).index(weekday_var.get())
-                if existing and existing.get('source') == 'freeword':
-                    # フリーワード由来の単発予約を毎週予約に切り替えた場合、
-                    # source/keyword_idを残したままだと、この予約のdate_isoが
-                    # 元の1回分の放送日のまま更新されないため、フリーワードの
-                    # 重複判定（局・放送日・開始時刻・番組名が一致するか）に
-                    # 毎回ひっかからず、同じキーワードに一致する将来の回を
-                    # 別の単発予約として際限なく自動作成し続けてしまう。
-                    # 毎週予約への切り替え後は手動管理の予約として扱う
-                    new_data['source'] = None
-                    new_data['keyword_id'] = None
             else:
                 date_text = date_var.get().strip()
                 try:
@@ -3199,6 +3451,7 @@ class RecRApp:
         止まってしまい、以降の予約録音が一切行われなくなる
         """
         try:
+            self._detect_reservation_check_gap()
             self._check_due_reservations()
             self._update_sleep_prevention()
         except Exception:
@@ -3206,6 +3459,24 @@ class RecRApp:
         self._reservation_check_job = self.root.after(
             self.RESERVATION_CHECK_INTERVAL_MS, self._schedule_reservation_check
         )
+
+    def _detect_reservation_check_gap(self, now=None):
+        """予約チェックの巡回が大きく空いていたら（スリープ・休止、またはメインスレッドが
+        応答しなかった）、ログに残し、その間に取り逃した予約の自動取得を前倒しで試みる"""
+        now = now or datetime.now()
+        last = self._last_reservation_check_at
+        self._last_reservation_check_at = now
+        if last is None:
+            return
+        gap = (now - last).total_seconds()
+        if gap < self.RESERVATION_CHECK_GAP_SECONDS:
+            return
+        logger.warning(
+            f"予約チェックが{int(gap // 60)}分間実行されていませんでした"
+            f"（{last.strftime('%Y-%m-%d %H:%M:%S')} 〜 {now.strftime('%Y-%m-%d %H:%M:%S')}）。"
+            "スリープ・休止状態か、アプリが応答していなかった可能性があります"
+        )
+        self._run_missed_reservation_recovery()
 
     def _on_prevent_sleep_changed(self):
         """設定メニューの「自動スリープを抑止する」チェック切り替え時の保存処理"""
@@ -3285,6 +3556,13 @@ class RecRApp:
 
             if self.manager.is_recording_active(station):
                 # 他の予約や手動録音でその局が使用中。マークせず次回の巡回で再試行する
+                key = (reservation['id'], occurrence_iso)
+                if key not in self._busy_skip_logged:
+                    self._busy_skip_logged.add(key)
+                    logger.info(
+                        f"局が使用中のため予約録音の開始を見送りました（猶予時間内は再試行）: "
+                        f"{station} {occurrence_iso} {reservation.get('start')} {reservation.get('title')}"
+                    )
                 continue
 
             started_any = True

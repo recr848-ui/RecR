@@ -100,6 +100,7 @@ def app(monkeypatch, tmp_path, shared_root):
         "_reservation_list_refresh_job",
         "_program_guide_refresh_job",
         "_full_refresh_check_job",
+        "_missed_recovery_job",
         "_eq_update_job",
         "_recording_watch_job",
         "_rec_blink_job",
@@ -742,3 +743,183 @@ def test_files_list_sorts_size_column_by_bytes(app, tmp_path):
 
     app._sort_treeview_column(tree, "size", True)
     assert [tree.set(item, "name") for item in tree.get_children("")] == ["b.mp3", "a.mp3", "c.mp3"]
+
+
+# --- 取り逃した予約の自動取得 ---------------------------------------------
+
+def _add_missed_reservation(app, station, hours_ago=2, **extra):
+    """放送が終わったのに一度も実行されなかった単発予約を1件追加する"""
+    start = (datetime.now() - timedelta(hours=hours_ago)).replace(second=0, microsecond=0)
+    if start.hour < 5 or start.hour >= 23:
+        pytest.skip("放送日（5時区切り）と日付またぎの扱いは別のテストで確認する")
+    data = {
+        "station": station, "title": "取り逃した番組", "repeat": "once",
+        "date_iso": start.date().isoformat(), "start": start.strftime("%H:%M"),
+        "end": (start + timedelta(minutes=50)).strftime("%H:%M"),
+        "source": "freeword", "keyword_id": "kw",
+    }
+    data.update(extra)
+    return app.manager.add_reservation(data)
+
+
+def _run_after_calls_for(calls, func):
+    for _, f, args in [c for c in calls if c[1] == func]:
+        f(*args)
+
+
+def _missed_recovery_target(app, reservation, station):
+    plan = app._missed_recovery_plan(app.manager.get_reservation(reservation["id"]))
+    assert plan is not None
+    plan.update(reservation_id=reservation["id"], station=station, title="取り逃した番組", metadata={})
+    return plan
+
+
+def test_missed_recovery_plan_waits_after_program_end_and_respects_limits(app):
+    station = app.manager.get_stations()[0]
+    reservation = _add_missed_reservation(app, station)
+    plan = app._missed_recovery_plan(reservation)
+    assert plan is not None and plan["ready"] and plan["attempts"] == 0
+
+    # 放送終了直後はまだ試みない
+    end_dt = plan["end_dt"]
+    assert app._missed_recovery_plan(reservation, now=end_dt + timedelta(minutes=1))["ready"] is False
+    # タイムフリー・聴き逃しの期限（約1週間）を過ぎたら対象外
+    assert app._missed_recovery_plan(reservation, now=end_dt + timedelta(days=8)) is None
+    # 同じ回で上限回数まで試したら対象外
+    app.manager.update_reservation(reservation["id"], {"auto_recovery": {
+        "occurrence": plan["occurrence"], "attempts": app.MISSED_RECOVERY_MAX_ATTEMPTS,
+    }})
+    assert app._missed_recovery_plan(app.manager.get_reservation(reservation["id"])) is None
+
+
+def test_missed_recovery_downloads_via_timefree_and_marks_downloaded(app, monkeypatch):
+    station = next(s for s in app.manager.get_stations() if not s.startswith("NHK"))
+    reservation = _add_missed_reservation(app, station)
+    calls = _record_after_calls(app, monkeypatch)
+    started = []
+
+    def fake_start(station_arg, ft, to, on_complete=None, **kwargs):
+        started.append((station_arg, ft, to))
+        on_complete(True, "out.m4a", None)
+        return True, "out.m4a"
+
+    monkeypatch.setattr(app.manager, "start_timefree_download", fake_start)
+    monkeypatch.setattr(app.manager, "is_download_limit_reached", lambda: False)
+    target = _missed_recovery_target(app, reservation, station)
+
+    app._recover_missed_reservation(target, "m4a", 192, "title_date")
+    _run_after_calls_for(calls, app._on_missed_recovery_finished)
+
+    assert started == [(station, target["start_dt"].strftime("%Y%m%d%H%M%S"),
+                        target["end_dt"].strftime("%Y%m%d%H%M%S"))]
+    saved = app.manager.get_reservation(reservation["id"])
+    assert saved["timefree_downloaded"] is True
+    assert saved["auto_recovery"] == {"occurrence": target["occurrence"], "attempts": 1}
+    assert app._missed_recovery_plan(saved) is None
+
+
+def test_missed_recovery_waits_without_counting_when_download_limit_reached(app, monkeypatch):
+    station = next(s for s in app.manager.get_stations() if not s.startswith("NHK"))
+    reservation = _add_missed_reservation(app, station)
+    _record_after_calls(app, monkeypatch)
+    monkeypatch.setattr(app.manager, "is_download_limit_reached", lambda: True)
+    monkeypatch.setattr(
+        app.manager, "start_timefree_download", lambda *a, **k: pytest.fail("上限なのに開始した")
+    )
+
+    app._recover_missed_reservation(_missed_recovery_target(app, reservation, station), "m4a", 192, "title_date")
+
+    assert not app.manager.get_reservation(reservation["id"]).get("auto_recovery")
+
+
+def test_missed_recovery_uses_radiru_for_nhk_and_counts_failed_attempts(app, monkeypatch):
+    """NHKはタイムフリーではなく聴き逃しで取る。聴き逃しに無い回（再放送枠など）は
+    失敗として数え、上限に達したら以後は試みない"""
+    station = "NHK FM（東京）"
+    reservation = _add_missed_reservation(app, station)
+    calls = _record_after_calls(app, monkeypatch)
+    monkeypatch.setattr(
+        app.manager, "start_timefree_download",
+        lambda *a, **k: pytest.fail("NHKをタイムフリーで取得しようとした"),
+    )
+    monkeypatch.setattr(app.radiru_manager, "find_series_for_program",
+                        lambda *a: {"series_site_id": "s", "corner_site_id": "c"})
+    monkeypatch.setattr(app.radiru_manager, "fetch_series_episodes", lambda *a: [])
+
+    for attempt in range(1, app.MISSED_RECOVERY_MAX_ATTEMPTS + 1):
+        target = _missed_recovery_target(app, reservation, station)
+        app._recover_missed_reservation(target, "m4a", 192, "title_date")
+        assert app.manager.get_reservation(reservation["id"])["auto_recovery"]["attempts"] == attempt
+
+    _run_after_calls_for(calls, app._on_missed_recovery_finished)
+    saved = app.manager.get_reservation(reservation["id"])
+    assert not saved.get("timefree_downloaded")
+    assert app._missed_recovery_plan(saved) is None
+
+
+def test_missed_recovery_downloads_nhk_episode_from_radiru(app, monkeypatch):
+    station = "NHK FM（東京）"
+    reservation = _add_missed_reservation(app, station)
+    calls = _record_after_calls(app, monkeypatch)
+    downloaded = []
+    monkeypatch.setattr(app.radiru_manager, "find_series_for_program",
+                        lambda *a: {"series_site_id": "s", "corner_site_id": "c"})
+    monkeypatch.setattr(app.radiru_manager, "fetch_series_episodes", lambda *a: ["ep"])
+    monkeypatch.setattr(app.radiru_manager, "find_episode_for_date",
+                        lambda episodes, start, end: {"stream_url": "https://example.invalid/x.m3u8"})
+    monkeypatch.setattr(app.radiru_manager, "download_episode",
+                        lambda url, path, on_progress=None: downloaded.append(url))
+    monkeypatch.setattr(app.manager, "write_metadata_tags", lambda *a: None)
+
+    app._recover_missed_reservation(_missed_recovery_target(app, reservation, station), "m4a", 192, "title_date")
+    _run_after_calls_for(calls, app._on_missed_recovery_finished)
+
+    assert downloaded == ["https://example.invalid/x.m3u8"]
+    assert app.manager.get_reservation(reservation["id"])["timefree_downloaded"] is True
+
+
+def test_missed_recovery_skips_when_disabled(app, monkeypatch):
+    _add_missed_reservation(app, app.manager.get_stations()[0])
+    started = []
+    monkeypatch.setattr(app, "_missed_recovery_worker", lambda *a: started.append(a))
+    app.auto_recover_missed_var.set(False)
+    app._run_missed_reservation_recovery()
+    assert started == []
+
+
+def test_reservation_check_gap_triggers_missed_recovery(app, monkeypatch):
+    triggered = []
+    monkeypatch.setattr(app, "_run_missed_reservation_recovery", lambda: triggered.append(True))
+    now = datetime.now()
+    app._last_reservation_check_at = None
+    app._detect_reservation_check_gap(now=now)
+    app._detect_reservation_check_gap(now=now + timedelta(seconds=15))
+    assert triggered == []
+    app._detect_reservation_check_gap(now=now + timedelta(hours=3))
+    assert triggered == [True]
+
+
+def test_editing_once_freeword_reservation_makes_it_manual(app):
+    """フリーワード由来の予約をダイアログで編集して保存したら手動予約として扱う
+    （番組表の更新で編集内容が戻されたり、削除されたりしないようにする）"""
+    reservation = app.manager.add_reservation({
+        'station': 'TBSラジオ', 'repeat': 'once', 'date_iso': '2026-09-01',
+        'start': '05:00', 'end': '06:00', 'title': 'テスト番組',
+        'source': 'freeword', 'keyword_id': 'kw1',
+    })
+    toplevels_before = set(app.root.winfo_children())
+    app._open_reservation_dialog(existing=reservation)
+    dialog = next(
+        w for w in app.root.winfo_children()
+        if w not in toplevels_before and isinstance(w, tk.Toplevel)
+    )
+    try:
+        _find_widgets(dialog, cls_name="TButton", text="保存")[0].invoke()
+    finally:
+        if dialog.winfo_exists():
+            dialog.destroy()
+
+    updated = app.manager.get_reservation(reservation['id'])
+    assert updated['repeat'] == 'once'
+    assert updated.get('source') is None
+    assert updated.get('keyword_id') is None
