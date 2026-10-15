@@ -72,6 +72,8 @@ class RadiruManager:
     # 配信側の尺に対して、保存できた長さがこの秒数を超えて短ければ欠落ありと
     # みなして失敗にする（セグメントは1件6秒。1件でも飛ばされたら検出する）
     DOWNLOAD_SHORTFALL_TOLERANCE_SECONDS = 3
+    # 聴き逃しダウンロード中、取得に失敗したセグメントを取り直す回数の上限
+    SEGMENT_MAX_RETRY = 5
 
     def __init__(self):
         self.cache_dir = get_base_dir() / "config"
@@ -352,6 +354,10 @@ class RadiruManager:
                 # Rangeヘッダーを送らない（送るとセグメント末尾が切り詰められて
                 # 音声が欠落する。docstringの1.を参照）
                 "http_seekable": "0",
+                # セグメントの取得に失敗したとき、飛ばさずにこの回数まで取り直す
+                # （既定の0では、一瞬の通信失敗でもそのセグメントの6秒が欠落する。
+                # 実機で、同時に他のダウンロードが動いていたときに発生した）
+                "seg_max_retry": str(self.SEGMENT_MAX_RETRY),
             },
             # （接続, 読み出し）の上限秒数。上の "timeout" は個々のHTTP通信の上限で、
             # セグメントを飛ばしながら進む読み出し全体は止められないため別に設ける
