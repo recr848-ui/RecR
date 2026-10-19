@@ -98,6 +98,11 @@ class RecRApp:
     # NOTICE.mdをmasterブランチにpushすると、次回起動時（または「更新」ボタン）で反映される
     NOTICE_URL = "https://raw.githubusercontent.com/recr848-ui/RecR/master/NOTICE.md"
 
+    # メニュー「ヘルプ」→「バージョン情報」に表示する版数。リリースのたびに更新する
+    APP_VERSION = "1.12"
+    # メニュー「ヘルプ」→「ヘルプ」で開くGitHub wikiの操作マニュアル
+    HELP_URL = "https://github.com/recr848-ui/RecR/wiki/操作マニュアル"
+
     def __init__(self, root):
         self.root = root
         self.root.title("RecR - ラジコ録音アプリ")
@@ -698,6 +703,11 @@ class RecRApp:
 
         menubar.add_cascade(label="設定", menu=settings_menu)
 
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="ヘルプ", command=lambda: webbrowser.open(self.HELP_URL))
+        help_menu.add_command(label="バージョン情報", command=self._show_version)
+        menubar.add_cascade(label="ヘルプ", menu=help_menu)
+
         self.root.config(menu=menubar)
 
         # tk.Menuはttkテーマの管理外のため、テーマ切り替え時に自前で配色し直せるよう
@@ -705,8 +715,13 @@ class RecRApp:
         self._menus = [
             menubar, file_menu, view_menu, eq_mode_menu, schedule_menu,
             settings_menu, quality_menu, filename_menu, default_station_menu, margin_menu,
+            help_menu,
         ]
         self._apply_menu_theme()
+
+    def _show_version(self):
+        """メニュー「ヘルプ」→「バージョン情報」: 版数を表示する"""
+        messagebox.showinfo("バージョン情報", f"RecR Ver{self.APP_VERSION}")
 
     def _on_theme_changed(self):
         """テーマ（ライト/ダーク）切り替え時: sv_ttkのテーマを反映し、Canvas系の配色も更新する"""
