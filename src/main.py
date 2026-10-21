@@ -1541,6 +1541,10 @@ class RecRApp:
         self._program_canvas_items = {}
         self._schedule_grid_height = 0
         self._highlight_reset_job = None
+        # NHK聴き逃しの回ごとの配信確認: 描画し直すたびに増やし、古い描画への
+        # 確認結果を捨てるための世代番号と、番組ごとのエピソード一覧のキャッシュ
+        self._radiru_check_generation = 0
+        self._radiru_episode_cache = {}
 
     def toggle_search_panel(self):
         """検索パネルの表示/非表示を切り替える"""
@@ -4295,6 +4299,8 @@ class RecRApp:
         self._schedule_item_programs = {}
         self._schedule_item_urls = {}
         self._schedule_display_mode = mode
+        # 前回の描画に対する聴き逃しの配信確認が残っていても、結果を反映させない
+        self._radiru_check_generation += 1
 
         today_iso = datetime.now().strftime("%Y-%m-%d")
         if mode == 'timefree':
@@ -4374,6 +4380,9 @@ class RecRApp:
             res for res in self.manager.load_reservations()
             if res.get('enabled', True) and res.get('station') == station
         ]
+        # 番組名がインデックスに載っている枠（rect, インデックスのエントリ, 放送枠）。
+        # 描画後にバックグラウンドで回ごとの配信有無を確かめる
+        radiru_checks = []
 
         for col, (date_label, day_programs) in enumerate(days.items()):
             col_left = self.TIME_LABEL_WIDTH + col * self.DAY_COLUMN_WIDTH
@@ -4436,14 +4445,16 @@ class RecRApp:
                 # NHK局のタイムフリー表示: NHK聴き逃しインデックスに番組名が
                 # 登録済みなら「ダウンロードできる見込みが高い」、未登録なら
                 # 「非対応か、まだインデックスに載っていない」として枠線で区別する。
-                # 対象日のエピソードが実際に配信中かまでは番組表の描画時点では
-                # 確認していない（番組の数だけネットワーク問い合わせが必要になり
-                # 重くなるため）ので、あくまで目安の表示
+                # 番組名が載っていても、再放送の枠（聴き逃しは本放送のみ）や
+                # 配信期限切れの回は取得できないため、描画後にバックグラウンドで
+                # 番組ごとのエピソード一覧を取得して回ごとに確かめ直す
+                # （_start_radiru_episode_check）
                 if show_radiru_availability and not not_yet_aired:
-                    available = self.radiru_manager.find_series_for_program(
+                    series_entry = self.radiru_manager.find_series_for_program(
                         radiru_broadcast_code, program.get('title') or '', program.get('corner_name'),
                         index=radiru_index,
-                    ) is not None
+                    )
+                    available = series_entry is not None
                     outline_color = (
                         colors['radiru_available_outline'] if available
                         else colors['radiru_unavailable_outline']
@@ -4454,6 +4465,11 @@ class RecRApp:
                     x1, y1, x2, y2, fill=fill_color, outline=outline_color, width=outline_width
                 )
                 items = [rect]
+
+                if show_radiru_availability and not not_yet_aired and series_entry is not None:
+                    air_start, air_end = self._program_air_window(program)
+                    if air_start is not None:
+                        radiru_checks.append((rect, series_entry, air_start, air_end))
 
                 lookup_key = (program.get('date_iso'), program.get('start'), program.get('title'))
                 self._program_canvas_items[lookup_key] = rect
@@ -4513,6 +4529,69 @@ class RecRApp:
 
         right_edge = self.TIME_LABEL_WIDTH + num_cols * self.DAY_COLUMN_WIDTH
         canvas.create_line(right_edge, 0, right_edge, grid_height, fill=colors['day_line'])
+
+        self._start_radiru_episode_check(radiru_checks)
+
+    # NHK聴き逃しのエピソード一覧を使い回す時間（秒）。局の切替や表示モードの
+    # 切替のたびに同じ番組を問い合わせ直さないため
+    RADIRU_EPISODE_CACHE_SECONDS = 600
+
+    def _start_radiru_episode_check(self, checks):
+        """番組表の描画後、NHK聴き逃しに番組名が載っている枠について、その回が
+        実際に配信中かをバックグラウンドで確かめる
+
+        番組名単位の判定だけでは、再放送の枠（「マイ・フェイバリット・アルバム」の
+        午後6時など、聴き逃しは本放送のみ）や配信期限切れの回まで「取得できる」
+        表示になってしまうため。問い合わせは枠ごとではなく番組（シリーズ）ごとに
+        1回だけ行う。
+        """
+        if not checks:
+            return
+        generation = self._radiru_check_generation
+        threading.Thread(
+            target=self._radiru_episode_check_worker, args=(generation, checks), daemon=True
+        ).start()
+
+    def _fetch_radiru_episodes_cached(self, series_site_id, corner_site_id):
+        """番組のエピソード一覧を、一定時間キャッシュしながら取得する"""
+        cache_key = (series_site_id, corner_site_id)
+        cached = self._radiru_episode_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < self.RADIRU_EPISODE_CACHE_SECONDS:
+            return cached[1]
+        episodes = self.radiru_manager.fetch_series_episodes(series_site_id, corner_site_id)
+        self._radiru_episode_cache[cache_key] = (time.monotonic(), episodes)
+        return episodes
+
+    def _radiru_episode_check_worker(self, generation, checks):
+        """_start_radiru_episode_check の本体（バックグラウンドスレッド）"""
+        unavailable_rects = []
+        episodes_by_series = {}
+        for rect, entry, air_start, air_end in checks:
+            if generation != self._radiru_check_generation:
+                return
+            series_key = (entry['series_site_id'], entry['corner_site_id'])
+            if series_key not in episodes_by_series:
+                try:
+                    episodes_by_series[series_key] = self._fetch_radiru_episodes_cached(*series_key)
+                except Exception:
+                    # 確かめられなかった番組は番組名単位の表示のままにしておく
+                    logger.warning(f"NHK聴き逃しのエピソード一覧取得に失敗しました ({entry.get('title')})",
+                                   exc_info=True)
+                    episodes_by_series[series_key] = None
+            episodes = episodes_by_series[series_key]
+            if episodes is None:
+                continue
+            if self.radiru_manager.find_episode_for_date(episodes, air_start, air_end) is None:
+                unavailable_rects.append(rect)
+        self.root.after(0, self._apply_radiru_episode_check, generation, unavailable_rects)
+
+    def _apply_radiru_episode_check(self, generation, unavailable_rects):
+        """回ごとの配信確認の結果を番組表に反映する（メインスレッドから呼ばれる）"""
+        if generation != self._radiru_check_generation:
+            return
+        outline = self._get_schedule_colors()['radiru_unavailable_outline']
+        for rect in unavailable_rects:
+            self.schedule_canvas.itemconfig(rect, outline=outline, width=1)
 
     def _schedule_item_under_pointer(self):
         """番組表キャンバス上で、いまマウスポインタの下にあるアイテムIDを返す（無ければNone）"""

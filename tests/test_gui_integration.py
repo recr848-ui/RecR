@@ -557,6 +557,48 @@ def test_timefree_columns_ordered_oldest_to_newest_left_to_right(app):
     assert labels == expected
 
 
+def test_nhk_timefree_grays_out_slots_without_radiru_episode(app, monkeypatch):
+    """NHKのタイムフリー表示で、番組名が聴き逃しインデックスに載っていても、
+    その回のエピソードが配信されていない枠（再放送の枠など）は、回ごとの
+    確認後に「取得不可」の枠線に戻ること。番組名だけの判定で緑枠のまま
+    になり、ダブルクリックすると取得できない、ということがあったため
+    """
+    d = datetime.now() - timedelta(days=1)
+    date_iso = d.strftime('%Y-%m-%d')
+    programs = [
+        {'date': f'{d.month}/{d.day}', 'date_iso': date_iso,
+         'start': '18:00', 'end': '18:50', 'title': 'マイ・フェイバリット・アルバム 再放送'},
+        {'date': f'{d.month}/{d.day}', 'date_iso': date_iso,
+         'start': '22:30', 'end': '23:20', 'title': 'マイ・フェイバリット・アルバム 本放送'},
+    ]
+    entry = {'series_site_id': 'S', 'corner_site_id': '01', 'title': 'マイ・フェイバリット・アルバム'}
+    monkeypatch.setattr(app.radiru_manager, "load_index", lambda: {})
+    monkeypatch.setattr(app.radiru_manager, "find_series_for_program", lambda *a, **k: entry)
+    fetch_calls = []
+    monkeypatch.setattr(app.radiru_manager, "fetch_series_episodes",
+                        lambda *a: fetch_calls.append(a) or [
+                            {'aa_contents_id': f'x_{date_iso}T22:30:00+09:00_{date_iso}T23:20:00+09:00'}
+                        ])
+    started = []
+    monkeypatch.setattr(RecRApp, "_start_radiru_episode_check",
+                        lambda self, checks: started.append(checks))
+    app.schedule_station_var.set("NHK FM(東京)")
+
+    app.display_schedule(programs, mode='timefree')
+    colors = app._get_schedule_colors()
+    rerun_rect = app._program_canvas_items[(date_iso, '18:00', programs[0]['title'])]
+    main_rect = app._program_canvas_items[(date_iso, '22:30', programs[1]['title'])]
+    assert app.schedule_canvas.itemcget(rerun_rect, 'outline') == colors['radiru_available_outline']
+
+    app._radiru_episode_check_worker(app._radiru_check_generation, started[0])
+    app.root.update()
+
+    assert app.schedule_canvas.itemcget(rerun_rect, 'outline') == colors['radiru_unavailable_outline']
+    assert app.schedule_canvas.itemcget(main_rect, 'outline') == colors['radiru_available_outline']
+    # 同じ番組のエピソード一覧は1回だけ問い合わせる
+    assert len(fetch_calls) == 1
+
+
 def test_wrap_cache_is_bounded(app, monkeypatch):
     """折り返し結果のキャッシュは上限件数を超えて増え続けない"""
     monkeypatch.setattr(app, "WRAP_CACHE_MAX_ENTRIES", 5)
