@@ -1025,3 +1025,49 @@ def test_get_due_reservations_logs_missed_start_once(manager, caplog):
         assert manager.get_due_reservations() == []
         manager.get_due_reservations()
     assert len([r for r in caplog.records if "始まらなかった番組" in r.getMessage()]) == 1
+
+
+# --- 録音ファイルへのタグ書き込み ------------------------------------------------
+
+def _make_m4a(path):
+    import av
+    import numpy as np
+
+    with av.open(str(path), "w", format="mp4") as container:
+        stream = container.add_stream("aac", rate=24000, layout="stereo")
+        for i in range(10):
+            frame = av.AudioFrame.from_ndarray(
+                np.zeros((1, 2048), dtype=np.int16), format="s16", layout="stereo"
+            )
+            frame.sample_rate = 24000
+            frame.pts = i * 1024
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+
+def test_write_metadata_tags_m4a_uses_filename_as_title_and_program_as_subtitle(manager, tmp_path):
+    import av
+    from mutagen.mp4 import MP4
+
+    path = tmp_path / "20261012_2105_テスト番組.m4a"
+    _make_m4a(path)
+    with av.open(str(path)) as c:
+        frames_before = sum(1 for _ in c.decode(audio=0))
+
+    # 2回書き込んでも Xtra ボックスが重複せず置き換わること
+    manager._write_metadata_tags(path, "m4a", {'title': '仮の番組', 'album': 'NHK AM'})
+    manager._write_metadata_tags(path, "m4a", {'title': 'あとは寝るだけの時間', 'album': 'NHK AM'})
+
+    tags = MP4(path)
+    assert tags['\xa9nam'] == ["20261012_2105_テスト番組"]
+    assert tags['\xa9alb'] == ["NHK AM"]
+    data = path.read_bytes()
+    assert data.count(b"Xtra") == 1
+    assert data.count(b"WM/SubTitle") == 1
+    assert "あとは寝るだけの時間".encode("utf-16-le") in data
+    assert "仮の番組".encode("utf-16-le") not in data
+    # チャンクオフセットが補正され、音声がそのまま再生できること
+    with av.open(str(path)) as c:
+        assert sum(1 for _ in c.decode(audio=0)) == frames_before
