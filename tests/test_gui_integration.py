@@ -478,6 +478,42 @@ def test_full_schedule_refresh_also_refreshes_timefree_cache(app, monkeypatch):
     assert app.manager.load_cached_schedule(f"{station}::timefree") == timefree_programs
 
 
+def test_full_schedule_refresh_waits_for_startup_stale_refresh(app, monkeypatch):
+    """起動時の自動番組表更新（_refresh_stale_stations）の実行中は毎日の全局自動更新を
+    始めず、終わったらすぐに始めること。
+
+    以前は両方が同時に走り、しばらく起動していなかった後の起動で同じ局の番組表を
+    二重に取得していた
+    """
+    started = []
+    monkeypatch.setattr(app, "_start_full_schedule_refresh", lambda: started.append(True))
+    monkeypatch.setattr(app, "FULL_SCHEDULE_REFRESH_TIME", "00:00")
+    app.manager.save_settings({'last_full_schedule_refresh_date': '2000-01-01'})
+
+    app._stale_refresh_in_progress = True
+    app._check_full_schedule_refresh_due()
+    assert started == []
+
+    dialog = tk.Toplevel(app.root)
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    app._on_stale_refresh_done(dialog, False, [], [], today_iso)
+    assert started == [True]
+    assert app._stale_refresh_in_progress is False
+
+
+def test_full_schedule_refresh_skips_stations_refreshed_at_startup(app):
+    """起動時の自動更新でその日に取得し終えた局は、毎日の全局自動更新で取得し直さないこと"""
+    stations = app.manager.get_stations()
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+
+    app._stations_refreshed_today = (today_iso, {stations[0]})
+    assert app._stations_for_full_refresh(today_iso) == stations[1:]
+
+    # 前日に取得した局は対象に戻す
+    app._stations_refreshed_today = ('2000-01-01', {stations[0]})
+    assert app._stations_for_full_refresh(today_iso) == stations
+
+
 def test_fetch_and_cache_schedule_also_refreshes_timefree_cache(app, monkeypatch):
     """fetch_and_cache_schedule（「番組表を取得」ボタン・起動時の自動更新・
     「番組表を一括更新」が共通で通る経路）を呼ぶと、通常の番組表と同じ

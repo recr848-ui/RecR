@@ -162,6 +162,12 @@ class RecRApp:
         self._program_guide_refresh_job = None
         self._full_refresh_check_job = None
         self._full_refresh_in_progress = False
+        # 起動時の自動番組表更新（_refresh_stale_stations）の実行中は、毎日の全局自動更新を
+        # 始めない。両方が同時に走ると、同じ局の番組表を二重に取得してしまうため
+        self._stale_refresh_in_progress = False
+        # (日付, {局名}): その日のうちに起動時の自動更新で取得し終えた局。
+        # 毎日の全局自動更新では取得し直さない
+        self._stations_refreshed_today = (None, set())
         self._radiru_refresh_check_job = None
         self._radiru_refresh_in_progress = False
         # 局名 -> {'title', 'start_dt', 'end_dt'}。手動・予約を問わず、現在進行中の
@@ -3958,6 +3964,9 @@ class RecRApp:
         if not stale_stations:
             return
 
+        self._stale_refresh_in_progress = True
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        logger.info(f"起動時の番組表自動更新を開始します（{len(stale_stations)}局）")
         dialog, progress_var, progressbar, cancel_event = self._open_schedule_fetch_progress_dialog(
             "番組表の自動更新"
         )
@@ -3966,6 +3975,7 @@ class RecRApp:
 
         def worker():
             failed_stations = []
+            refreshed_stations = []
             any_created = False
             completed = 0
             lock = threading.Lock()
@@ -3976,7 +3986,9 @@ class RecRApp:
                     return
                 success, created, error_label = self._fetch_and_cache_schedule_no_ui(station, cancel_event)
                 with lock:
-                    if not success:
+                    if success:
+                        refreshed_stations.append(station)
+                    else:
                         failed_stations.append(error_label)
                     if created:
                         any_created = True
@@ -3990,14 +4002,25 @@ class RecRApp:
             with ThreadPoolExecutor(max_workers=self.SCHEDULE_STATION_FETCH_WORKERS) as executor:
                 list(executor.map(fetch_one, stale_stations))
 
-            self.root.after(0, self._on_stale_refresh_done, dialog, any_created, failed_stations)
+            self.root.after(
+                0, self._on_stale_refresh_done, dialog, any_created, failed_stations,
+                refreshed_stations, today_iso
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_stale_refresh_done(self, dialog, any_created, failed_stations):
+    def _on_stale_refresh_done(self, dialog, any_created, failed_stations,
+                               refreshed_stations, today_iso):
         """起動時の自動番組表更新の完了処理（メインスレッドで実行）"""
         dialog.grab_release()
         dialog.destroy()
+
+        self._stale_refresh_in_progress = False
+        self._stations_refreshed_today = (today_iso, set(refreshed_stations))
+        # 実行中に見送った毎日の全局自動更新を、次のチェック（既定10分後）を待たずに判定し直す
+        if self._full_refresh_check_job:
+            self.root.after_cancel(self._full_refresh_check_job)
+        self._check_full_schedule_refresh_due()
 
         if any_created:
             self._refresh_reservation_list()
@@ -4032,6 +4055,7 @@ class RecRApp:
             now >= target_dt
             and last_date != now.strftime("%Y-%m-%d")
             and not self._full_refresh_in_progress
+            and not self._stale_refresh_in_progress
         ):
             self._start_full_schedule_refresh()
 
@@ -4087,11 +4111,23 @@ class RecRApp:
         """全局の番組表をバックグラウンドスレッドで取得し直す（UIは一切ブロックしない）"""
         self._full_refresh_in_progress = True
         today_iso = datetime.now().strftime("%Y-%m-%d")
-        stations = self.manager.get_stations()
+        stations = self._stations_for_full_refresh(today_iso)
         thread = threading.Thread(
             target=self._full_schedule_refresh_worker, args=(stations, today_iso), daemon=True
         )
         thread.start()
+
+    def _stations_for_full_refresh(self, today_iso):
+        """毎日の全局自動更新で取得する局（その日に起動時の自動更新で取得済みの局は除く）"""
+        stations = self.manager.get_stations()
+        refreshed_date, refreshed = self._stations_refreshed_today
+        if refreshed_date != today_iso or not refreshed:
+            return stations
+        remaining = [s for s in stations if s not in refreshed]
+        logger.info(
+            f"起動時の自動更新で取得済みの{len(stations) - len(remaining)}局は全局自動更新から除きます"
+        )
+        return remaining
 
     def _full_schedule_refresh_worker(self, stations, today_iso):
         """バックグラウンドスレッド本体: 全局を順に取得し、フリーワード照合も行う。
