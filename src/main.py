@@ -42,6 +42,7 @@ _URL_PATTERN = re.compile(r'https?://[^\s"\'<>]+')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.app_logger import LOG_DIR, setup_logging
+from utils.cm_fingerprint import FingerprintCollector
 from utils.paths import get_base_dir
 from utils.radiko_manager import RadikoManager, keyword_matches
 from utils.radiru_manager import RadiruManager
@@ -155,6 +156,10 @@ class RecRApp:
             'recording_margin_seconds', self.manager.recording_margin_seconds
         )
         self.recording_margin_var = tk.IntVar(value=self.manager.recording_margin_seconds)
+        # CMカット用の音声フィンガープリント取得（毎日指定時刻にタイムフリーで前日分を取る）
+        self.cm_fp_collector = FingerprintCollector(self.manager, self._cm_fp_busy_reason, LOG_DIR)
+        self.cm_fp_collector.update_settings(settings)
+        self._cm_fp_check_job = None
 
         self._busy_saved_states = {}
         self._reservation_check_job = None
@@ -203,6 +208,10 @@ class RecRApp:
         self._schedule_program_guide_minute_refresh()
         self._check_full_schedule_refresh_due()
         self._check_radiru_index_refresh_due()
+        # 起動直後は番組表の自動更新などと重ならないよう少し待ってから始める
+        self._cm_fp_check_job = self.root.after(
+            self.CM_FP_STARTUP_DELAY_MS, self._check_cm_fp_run_due
+        )
         self.root.after(1500, self._notify_missed_reservations_on_startup)
         # 起動直後は番組表の自動更新などと重ならないよう少し待ってから始める
         self._missed_recovery_job = self.root.after(60 * 1000, self._schedule_missed_reservation_recovery)
@@ -337,6 +346,10 @@ class RecRApp:
         if self._missed_recovery_job:
             self.root.after_cancel(self._missed_recovery_job)
             self._missed_recovery_job = None
+        if self._cm_fp_check_job:
+            self.root.after_cancel(self._cm_fp_check_job)
+            self._cm_fp_check_job = None
+        self.cm_fp_collector.stop("アプリ終了", wait=3)
         self.manager.stop_playback()
         self.manager.stop_recording()
         self.manager.stop_all_downloads()
@@ -682,6 +695,9 @@ class RecRApp:
         settings_menu.add_command(
             label="タイムフリー同時ダウンロード数...",
             command=self._change_max_concurrent_timefree_downloads
+        )
+        settings_menu.add_command(
+            label="CMフィンガープリント取得...", command=self._open_cm_fp_dialog
         )
 
         margin_menu = tk.Menu(settings_menu, tearoff=0)
@@ -3516,9 +3532,9 @@ class RecRApp:
         設定メニューでオフにしている場合はこの抑止を行わない。
         """
         should_prevent = self.prevent_sleep_var.get() and (
-            self.manager.is_recording_active() or any(
-                res.get('enabled', True) for res in self.manager.load_reservations()
-            )
+            self.manager.is_recording_active()
+            or self.cm_fp_collector.is_running()
+            or any(res.get('enabled', True) for res in self.manager.load_reservations())
         )
         if should_prevent == self._sleep_prevented:
             return
@@ -4106,6 +4122,194 @@ class RecRApp:
             logger.exception("NHK聴き逃しインデックスの更新に失敗しました")
         finally:
             self._radiru_refresh_in_progress = False
+
+    # CMフィンガープリントの自動取得: 起動後に最初のチェックを行うまでの待ち時間と、
+    # 以降のチェック間隔（ミリ秒）
+    CM_FP_STARTUP_DELAY_MS = 2 * 60 * 1000
+    CM_FP_CHECK_INTERVAL_MS = 60 * 1000
+
+    def _check_cm_fp_run_due(self):
+        """CMフィンガープリントの自動取得（1日1回）を始める時刻かを定期的にチェックする
+
+        全局番組表の自動更新と同じく「指定時刻を過ぎていて、その日まだ始めていなければ
+        始める」ので、指定時刻にPCが止まっていても、次に起動したときに取り戻せる。
+        """
+        try:
+            settings = self.manager.load_settings()
+            if settings.get('cm_fp_enabled'):
+                now = datetime.now()
+                try:
+                    target_time = datetime.strptime(settings.get('cm_fp_time', "06:00"), "%H:%M").time()
+                except ValueError:
+                    target_time = datetime.strptime("06:00", "%H:%M").time()
+                today_iso = now.strftime("%Y-%m-%d")
+                if (
+                    now >= datetime.combine(now.date(), target_time)
+                    and settings.get('cm_fp_last_run_date') != today_iso
+                    and not self.cm_fp_collector.is_running()
+                ):
+                    self.manager.save_settings({'cm_fp_last_run_date': today_iso})
+                    self.cm_fp_collector.update_settings(settings)
+                    self.cm_fp_collector.start_run("毎日の自動取得")
+                    logger.info("CMフィンガープリントの自動取得を開始しました")
+        except Exception:
+            logger.exception("CMフィンガープリントの自動取得チェックでエラーが発生しました")
+        self._cm_fp_check_job = self.root.after(self.CM_FP_CHECK_INTERVAL_MS, self._check_cm_fp_run_due)
+
+    def _cm_fp_busy_reason(self):
+        """CMフィンガープリント取得を止めるべきなら理由を返す（取得スレッドから呼ばれる）
+
+        オンタイム録音・タイムフリー取得・NHK聴き逃し取得の間は止める。
+        """
+        parts = []
+        recordings = sorted(self._active_recordings)
+        if recordings:
+            parts.append(f"オンタイム録音中（{'、'.join(recordings)}）")
+        elif self.manager.is_recording_active():
+            parts.append("オンタイム録音中")
+        downloads = list(self._active_downloads.values())
+        if downloads:
+            titles = "、".join(f"{e['station']}「{e['title']}」" for e in downloads)
+            parts.append(f"タイムフリー・聴き逃し取得中（{titles}）")
+        elif self.manager.has_active_downloads():
+            parts.append("タイムフリー取得中")
+        return "・".join(parts) or None
+
+    def _open_cm_fp_dialog(self):
+        """メニュー「設定」→「CMフィンガープリント取得...」: 設定と状態の表示、今すぐ取得・停止"""
+        settings = self.manager.load_settings()
+        collector = self.cm_fp_collector
+        current = dict(collector.settings)
+        current.update({k: settings[k] for k in current if k in settings})
+
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("CMフィンガープリント取得")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="CMカットの準備として、予約が入っている局（NHKを除く）の放送を\n"
+                 "タイムフリーで取得し、音声の指紋を保存します。\n"
+                 "録音・タイムフリー取得・聴き逃し取得の間は止まり、終わると再開します。",
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        enabled_var = tk.BooleanVar(value=bool(current['cm_fp_enabled']))
+        ttk.Checkbutton(frame, text="毎日自動で取得する", variable=enabled_var).pack(anchor=tk.W)
+
+        time_row = ttk.Frame(frame)
+        time_row.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(time_row, text="開始時刻: ").pack(side=tk.LEFT)
+        time_frame, hour_var, minute_var = self._create_time_selectors(
+            time_row, initial=current['cm_fp_time']
+        )
+        time_frame.pack(side=tk.LEFT)
+
+        window_row = ttk.Frame(frame)
+        window_row.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(window_row, text="取得する時間帯: ").pack(side=tk.LEFT)
+        hours = [str(h) for h in range(5, 30)]
+        window_start_var = tk.StringVar(value=str(current['cm_fp_window_start']))
+        window_end_var = tk.StringVar(value=str(current['cm_fp_window_end']))
+        ttk.Combobox(
+            window_row, textvariable=window_start_var, values=hours, state="readonly", width=3
+        ).pack(side=tk.LEFT)
+        ttk.Label(window_row, text="時 〜 ").pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Combobox(
+            window_row, textvariable=window_end_var, values=hours, state="readonly", width=3
+        ).pack(side=tk.LEFT)
+        ttk.Label(window_row, text="時（24時以降は翌日。例: 27時 = 翌3時）").pack(side=tk.LEFT, padx=(4, 0))
+
+        retention_row = ttk.Frame(frame)
+        retention_row.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(retention_row, text="指紋の保存期間: ").pack(side=tk.LEFT)
+        retention_var = tk.StringVar(value=str(current['cm_fp_retention_days']))
+        ttk.Combobox(
+            retention_row, textvariable=retention_var,
+            values=["7", "14", "21", "28", "42", "56", "90"], state="readonly", width=4
+        ).pack(side=tk.LEFT)
+        ttk.Label(retention_row, text="日").pack(side=tk.LEFT, padx=(4, 0))
+
+        keep_audio_var = tk.BooleanVar(value=bool(current['cm_fp_keep_audio']))
+        ttk.Checkbutton(
+            frame, text="取得した音声も保存する（調整用。1局1時間あたり約20MB）",
+            variable=keep_audio_var
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+        status_var = tk.StringVar()
+        ttk.Label(frame, textvariable=status_var, foreground="#3a6ea5").pack(anchor=tk.W, pady=(12, 0))
+
+        def refresh_status():
+            if not dialog.winfo_exists():
+                return
+            status = collector.get_status()
+            text = status['message']
+            if status['state'] != 'idle' and status['total']:
+                text += f"　{status['done']}/{status['total']}件完了"
+            status_var.set(f"状態: {text}")
+            run_button.config(state=tk.DISABLED if collector.is_running() else tk.NORMAL)
+            stop_button.config(state=tk.NORMAL if collector.is_running() else tk.DISABLED)
+            dialog.after(1000, refresh_status)
+
+        def collect_values():
+            start, end = int(window_start_var.get()), int(window_end_var.get())
+            if start >= end:
+                messagebox.showerror(
+                    "CMフィンガープリント取得", "時間帯の終わりは始まりより後にしてください", parent=dialog
+                )
+                return None
+            return {
+                'cm_fp_enabled': enabled_var.get(),
+                'cm_fp_time': self._get_time_value(hour_var, minute_var),
+                'cm_fp_window_start': start,
+                'cm_fp_window_end': end,
+                'cm_fp_retention_days': int(retention_var.get()),
+                'cm_fp_keep_audio': keep_audio_var.get(),
+            }
+
+        def apply_values():
+            values = collect_values()
+            if values is None:
+                return None
+            self.manager.save_settings(values)
+            collector.update_settings(values)
+            if not values['cm_fp_enabled'] and collector.is_running():
+                collector.stop("自動取得をオフにしました")
+            return values
+
+        def on_save():
+            if apply_values() is not None:
+                dialog.destroy()
+
+        def on_run_now():
+            if apply_values() is None:
+                return
+            collector.start_run("今すぐ取得")
+            logger.info("CMフィンガープリントの取得を手動で開始しました")
+
+        def on_stop():
+            collector.stop("停止ボタン")
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=(15, 0))
+        run_button = ttk.Button(button_frame, text="今すぐ取得", command=on_run_now)
+        run_button.pack(side=tk.LEFT, padx=5)
+        stop_button = ttk.Button(button_frame, text="停止", command=on_stop)
+        stop_button.pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            button_frame, text="ログフォルダを開く", command=lambda: os.startfile(str(LOG_DIR))
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="保存", command=on_save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="閉じる", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+        refresh_status()
+        self._center_dialog_over_parent(dialog)
+        dialog.deiconify()
 
     def _start_full_schedule_refresh(self):
         """全局の番組表をバックグラウンドスレッドで取得し直す（UIは一切ブロックしない）"""

@@ -17,7 +17,7 @@ Tkの実ウィンドウはテストごとに作り直すとTcl側の状態がま
 """
 import tkinter as tk
 from datetime import datetime, timedelta
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 import pytest
 import sv_ttk
@@ -101,6 +101,7 @@ def app(monkeypatch, tmp_path, shared_root):
         "_program_guide_refresh_job",
         "_full_refresh_check_job",
         "_missed_recovery_job",
+        "_cm_fp_check_job",
         "_eq_update_job",
         "_recording_watch_job",
         "_rec_blink_job",
@@ -1001,3 +1002,36 @@ def test_editing_once_freeword_reservation_makes_it_manual(app):
     assert updated['repeat'] == 'once'
     assert updated.get('source') is None
     assert updated.get('keyword_id') is None
+
+
+def test_cm_fp_busy_reason_reports_recordings_and_downloads(app):
+    """CMフィンガープリント取得は、オンタイム録音・タイムフリー/聴き逃し取得の間は止まる"""
+    assert app._cm_fp_busy_reason() is None
+    app._active_recordings["TBS"] = {'title': "x", 'start_dt': None, 'end_dt': None}
+    app._active_downloads["NHK-FM|radiru|1"] = {'station': "NHK-FM", 'title': "y"}
+    reason = app._cm_fp_busy_reason()
+    assert "オンタイム録音中（TBS）" in reason
+    assert "NHK-FM「y」" in reason
+
+
+def test_cm_fp_dialog_saves_settings(app):
+    """設定画面で保存した値が設定ファイルと取得処理の両方に反映される"""
+    before = set(app.root.winfo_children())
+    app._open_cm_fp_dialog()
+    dialog = next(w for w in app.root.winfo_children() if w not in before)
+
+    def find(widget, cls, text):
+        for child in widget.winfo_children():
+            if isinstance(child, cls) and child.cget("text") == text:
+                return child
+            found = find(child, cls, text)
+            if found is not None:
+                return found
+        return None
+
+    find(dialog, ttk.Checkbutton, "毎日自動で取得する").invoke()
+    find(dialog, ttk.Button, "保存").invoke()
+    assert app.manager.load_settings()['cm_fp_enabled'] is True
+    assert app.manager.load_settings()['cm_fp_window_start'] == 11
+    assert app.cm_fp_collector.settings['cm_fp_enabled'] is True
+    assert not dialog.winfo_exists()

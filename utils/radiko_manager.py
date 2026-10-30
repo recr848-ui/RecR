@@ -1958,6 +1958,11 @@ class RadikoManager:
             entry = self._downloads.get(key)
             return bool(entry and entry['thread'].is_alive())
 
+    def has_active_downloads(self):
+        """タイムフリーのダウンロードが1件でも実行中かどうか"""
+        with self._downloads_lock:
+            return any(e['thread'].is_alive() for e in self._downloads.values())
+
     def is_download_limit_reached(self):
         """タイムフリーの同時ダウンロード数が max_concurrent_timefree_downloads の
         上限に達しているかどうか"""
