@@ -100,7 +100,7 @@ class RecRApp:
     NOTICE_URL = "https://raw.githubusercontent.com/recr848-ui/RecR/master/NOTICE.md"
 
     # メニュー「ヘルプ」→「バージョン情報」に表示する版数。リリースのたびに更新する
-    APP_VERSION = "1.16"
+    APP_VERSION = "1.20α"
     # メニュー「ヘルプ」→「ヘルプ」で開くGitHub wikiの操作マニュアル
     HELP_URL = "https://github.com/recr848-ui/RecR/wiki/操作マニュアル"
 
