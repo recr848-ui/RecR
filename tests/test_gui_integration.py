@@ -65,6 +65,11 @@ def app(monkeypatch, tmp_path, shared_root):
     # お知らせ欄の取得も同じ理由（実ネットワークアクセス・テスト終了後の
     # バックグラウンドスレッド）でテスト対象外とする
     monkeypatch.setattr(RecRApp, "_refresh_notice", lambda self: None)
+    # 起動時の番組表の自動更新と聴き逃しインデックスの更新も同じ理由で動かさない。
+    # テスト終了後も動き続けると、別のテストが差し替えたos.replaceを呼んで結果を狂わせ、
+    # 終了時にTkの後始末で固まる
+    monkeypatch.setattr(RecRApp, "_refresh_stale_stations", lambda self: None)
+    monkeypatch.setattr(RecRApp, "_start_radiru_index_refresh", lambda self: None)
     # sv_ttkは同一プロセス内で複数回テーマを読み込むと
     # 「Theme ... already exists」で落ちるため、テストでは適用自体をスキップする
     monkeypatch.setattr(sv_ttk, "set_theme", lambda *a, **k: None)
@@ -102,6 +107,7 @@ def app(monkeypatch, tmp_path, shared_root):
         "_full_refresh_check_job",
         "_missed_recovery_job",
         "_cm_fp_check_job",
+        "_radiru_refresh_check_job",
         "_eq_update_job",
         "_recording_watch_job",
         "_rec_blink_job",
