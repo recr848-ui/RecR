@@ -1871,7 +1871,7 @@ class RadikoManager:
 
         Args:
             station (str): ステーション名
-            duration (int): 録音時間（分）
+            duration (int または float): 録音時間（分）
             file_format (str): "aac"（再エンコードなしでそのまま保存）、"m4a"（再エンコードなし
                 でMP4コンテナにストリームコピー。Windows Explorer等でもタグが読める）、
                 または "mp3"（re-encode）
@@ -1948,7 +1948,7 @@ class RadikoManager:
                 'reservation_id': reservation_id,
             }
         thread.start()
-        logger.info(f"録音開始: {station} ({duration}分, {file_format}) -> {output_path}")
+        logger.info(f"録音開始: {station} ({round(duration, 1):g}分, {file_format}) -> {output_path}")
         return True, str(output_path)
 
     def is_download_active(self, station, ft):
@@ -2401,7 +2401,11 @@ class RadikoManager:
                 self._levels = [0.0] * self.EQ_NUM_BANDS
                 self._lr_levels = [0.0, 0.0]
             with registry_lock:
-                registry.pop(registry_key, None)
+                # stop_recording の待ち時間を過ぎてから終わった場合、同じ局の次の録音が
+                # 既に登録されていることがある。それを消さないよう自分の分だけ取り除く
+                entry = registry.get(registry_key)
+                if entry is not None and entry.get('thread') in (None, threading.current_thread()):
+                    registry.pop(registry_key, None)
             if error_message:
                 logger.warning(f"録音終了: {station} -> {output_path} (エラー: {error_message})")
             else:
@@ -2431,6 +2435,14 @@ class RadikoManager:
                     return entry.get('reservation_id') == reservation_id
                 return True
             return any(entry['thread'].is_alive() for entry in self._recordings.values())
+
+    def recording_reservation_id(self, station):
+        """指定した局で録音中の予約ID（録音中でない、または手動録音なら None）"""
+        with self._recordings_lock:
+            entry = self._recordings.get(station)
+            if not entry or not entry['thread'].is_alive():
+                return None
+            return entry.get('reservation_id')
 
     def stop_recording(self, station=None):
         """録音を停止する

@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timedelta
 
 import pytest
@@ -1071,3 +1072,25 @@ def test_write_metadata_tags_m4a_uses_filename_as_title_and_program_as_subtitle(
     # チャンクオフセットが補正され、音声がそのまま再生できること
     with av.open(str(path)) as c:
         assert sum(1 for _ in c.decode(audio=0)) == frames_before
+
+
+def test_recording_reservation_id(manager):
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    assert manager.recording_reservation_id("TBS") is None
+    manager._recordings["TBS"] = {'thread': AliveThread(), 'reservation_id': "abc"}
+    assert manager.recording_reservation_id("TBS") == "abc"
+    manager._recordings["TBS"] = {'thread': AliveThread(), 'reservation_id': None}
+    assert manager.recording_reservation_id("TBS") is None
+
+
+def test_finished_worker_does_not_remove_next_recording_of_same_station(manager, tmp_path):
+    """引き継ぎの後に前の録音スレッドが終わっても、次の録音の登録を消さない"""
+    other = object()
+    manager._recordings["TBS"] = {'thread': other, 'stop_event': None, 'output_path': None}
+    manager._recording_worker(
+        iter([]), threading.Event(), tmp_path / "x.aac", "aac", 192, None, "TBS"
+    )
+    assert manager._recordings["TBS"]['thread'] is other

@@ -3595,7 +3595,9 @@ class RecRApp:
                 started_any = True
                 continue
 
-            if self.manager.is_recording_active(station):
+            if self.manager.is_recording_active(station) and not self._hand_off_recording(
+                reservation, start_dt
+            ):
                 # 他の予約や手動録音でその局が使用中。マークせず次回の巡回で再試行する
                 key = (reservation['id'], occurrence_iso)
                 if key not in self._busy_skip_logged:
@@ -3634,6 +3636,26 @@ class RecRApp:
         if started_any:
             self._refresh_reservation_list()
 
+    def _hand_off_recording(self, reservation, record_start_dt):
+        """同じ局で録音中の、隣り合う前の予約を止めて reservation に場所を空ける
+
+        Returns:
+            bool: 止めて録音できる状態になったか
+        """
+        station = reservation.get('station')
+        prior_id = self.manager.recording_reservation_id(station)
+        info = self._active_recordings.get(station)
+        if prior_id is None or prior_id == reservation['id'] or info is None:
+            return False
+        if not reservation_logic.should_hand_off_recording(
+            datetime.now(), record_start_dt, info['end_dt'],
+            self.manager.recording_margin_seconds, self.RESERVATION_CHECK_INTERVAL_MS / 1000,
+        ):
+            return False
+        logger.info(f"次の予約へ録音を引き継ぎます: {station} 「{info['title']}」→「{reservation.get('title')}」")
+        self.manager.stop_recording(station)
+        return not self.manager.is_recording_active(station)
+
     def _start_reservation_recording(self, reservation, end_dt, occurrence_iso):
         """予約 reservation の録音を、今から end_dt までの長さで開始する
 
@@ -3644,7 +3666,8 @@ class RecRApp:
             bool: 録音を開始できたか
         """
         station = reservation.get('station')
-        duration_minutes = max(1, math.ceil((end_dt - datetime.now()).total_seconds() / 60))
+        # 分単位に切り上げると end_dt を最大1分過ぎても録音が続き、同じ局の次の予約の冒頭が欠ける
+        duration_minutes = max(0.1, (end_dt - datetime.now()).total_seconds() / 60)
         file_format = self.format_var.get()
         try:
             mp3_bitrate = int(self.bitrate_var.get())

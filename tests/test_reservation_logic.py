@@ -225,3 +225,22 @@ def test_format_duration_hours_and_minutes():
 
 def test_format_duration_negative_clamped_to_zero():
     assert rl.format_duration(-10) == "0秒"
+
+
+# --- should_hand_off_recording ---------------------------------------------------
+
+def _hand_off(now, prior_end, next_start=datetime(2026, 11, 2, 0, 59, 30), margin=30, lead=15):
+    return rl.should_hand_off_recording(now, next_start, prior_end, margin, lead)
+
+
+def test_hand_off_waits_until_just_before_next_program():
+    prior_end = datetime(2026, 11, 2, 1, 0, 30)
+    assert not _hand_off(datetime(2026, 11, 2, 0, 59, 40), prior_end)
+    assert _hand_off(datetime(2026, 11, 2, 0, 59, 45), prior_end)
+    assert _hand_off(datetime(2026, 11, 2, 1, 0, 0), prior_end)
+
+
+def test_hand_off_refuses_when_prior_program_runs_past_next_start():
+    """番組表の上で重なる予約は、録音中の方を途中で切らない"""
+    prior_end = datetime(2026, 11, 2, 1, 30, 30)
+    assert not _hand_off(datetime(2026, 11, 2, 1, 0, 0), prior_end)

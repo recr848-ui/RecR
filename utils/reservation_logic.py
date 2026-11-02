@@ -7,6 +7,9 @@ RecRApp（src/main.py）はこれらの薄いラッパーとして各メソッ�
 
 from datetime import datetime, timedelta
 
+# 録音中の予約と次の予約を「隣り合っている」とみなす、番組の終了と開始のずれの上限（秒）
+HAND_OFF_ADJACENT_TOLERANCE_SECONDS = 60
+
 
 def program_actual_date_iso(date_iso, start_hhmm):
     """番組の date_iso（放送日、5:00始まり）と start（HH:MM）から、
@@ -55,6 +58,29 @@ def program_air_window(program):
     if end_dt <= start_dt:
         end_dt += timedelta(days=1)
     return start_dt, end_dt
+
+
+def should_hand_off_recording(now, next_record_start, prior_record_end, margin_seconds, lead_seconds):
+    """同じ局で録音中の予約を止めて、次の予約へ切り替えるタイミングかどうかを判定する
+
+    前後マージンがあると、同じ局で続けて放送される番組の録音は重なる。局ごとに同時に
+    録音できるのは1本だけなので、前の録音が終わるのを待つと次の番組の冒頭が欠ける。
+    番組同士が隣り合っている（前の番組が次の番組の開始までに終わる）ときだけ、次の番組の
+    開始の lead_seconds 秒前から切り替える。
+
+    Args:
+        now (datetime): 現在時刻
+        next_record_start (datetime): 次の予約の録音開始時刻（マージン込み）
+        prior_record_end (datetime): 録音中の予約の録音終了時刻（マージン込み）
+        margin_seconds (int): 前後マージンの秒数
+        lead_seconds (int): 次の番組の開始より何秒前から切り替えてよいか
+    """
+    margin = timedelta(seconds=margin_seconds)
+    next_start = next_record_start + margin
+    prior_end = prior_record_end - margin
+    if prior_end > next_start + timedelta(seconds=HAND_OFF_ADJACENT_TOLERANCE_SECONDS):
+        return False
+    return now >= next_start - timedelta(seconds=lead_seconds)
 
 
 def program_matches_reservation(station, program, reservation):

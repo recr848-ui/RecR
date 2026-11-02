@@ -1035,3 +1035,63 @@ def test_cm_fp_dialog_saves_settings(app):
     assert app.manager.load_settings()['cm_fp_window_start'] == 11
     assert app.cm_fp_collector.settings['cm_fp_enabled'] is True
     assert not dialog.winfo_exists()
+
+
+def _adjacent_reservations(app, monkeypatch, prior_id="prior", prior_end=None, now=None):
+    """同じ局の録音中の予約と、開始を迎えた次の予約を用意する"""
+    now = now or datetime.now()
+    prior_end = prior_end or now + timedelta(seconds=20)
+    reservation = {'id': "next", 'station': "TBS", 'title': "次の番組", 'start': "01:00", 'end': "01:30"}
+    record_start = now - timedelta(seconds=25)
+    record_end = now + timedelta(minutes=30)
+    monkeypatch.setattr(app.manager, "recording_margin_seconds", 30)
+    monkeypatch.setattr(
+        app.manager, "get_due_reservations",
+        lambda: [(reservation, record_start, record_end, now.date().isoformat())]
+    )
+    active = {'value': True}
+    stopped = []
+
+    def stop_recording(station=None):
+        stopped.append(station)
+        active['value'] = False
+
+    monkeypatch.setattr(app.manager, "is_recording_active", lambda *a, **k: active['value'])
+    monkeypatch.setattr(app.manager, "recording_reservation_id", lambda station: prior_id)
+    monkeypatch.setattr(app.manager, "stop_recording", stop_recording)
+    app._active_recordings["TBS"] = {'title': "前の番組", 'start_dt': now, 'end_dt': prior_end}
+    started = []
+    monkeypatch.setattr(
+        app, "_start_reservation_recording", lambda *a: started.append(a) or True
+    )
+    return stopped, started
+
+
+def test_adjacent_reservation_takes_over_recording_of_same_station(app, monkeypatch):
+    """同じ局で続く番組は、次の番組の開始で録音を引き継ぐ（冒頭を欠かさない）"""
+    stopped, started = _adjacent_reservations(app, monkeypatch)
+    app._check_due_reservations()
+    assert stopped == ["TBS"]
+    assert len(started) == 1
+
+
+def test_manual_recording_is_not_taken_over(app, monkeypatch):
+    stopped, started = _adjacent_reservations(app, monkeypatch, prior_id=None)
+    app._check_due_reservations()
+    assert stopped == [] and started == []
+
+
+def test_same_reservation_does_not_take_over_itself(app, monkeypatch):
+    """録音を始めた直後の巡回で、同じ予約が自分自身を止めない"""
+    stopped, started = _adjacent_reservations(app, monkeypatch, prior_id="next")
+    app._check_due_reservations()
+    assert stopped == [] and started == []
+
+
+def test_overlapping_reservation_does_not_cut_running_recording(app, monkeypatch):
+    now = datetime.now()
+    stopped, started = _adjacent_reservations(
+        app, monkeypatch, prior_end=now + timedelta(minutes=20), now=now
+    )
+    app._check_due_reservations()
+    assert stopped == [] and started == []
