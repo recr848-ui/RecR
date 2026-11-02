@@ -9,8 +9,8 @@ import pytest
 
 from utils import cm_fingerprint as cmfp
 from utils.cm_fingerprint import (
-    FingerprintBuilder, FingerprintCollector, plan_chunks, read_fp_file, target_stations,
-    write_fp_file,
+    FingerprintBuilder, FingerprintCollector, off_air_overlap, off_air_windows, plan_chunks,
+    read_fp_file, reserved_hours, target_stations, write_fp_file,
 )
 
 MAPPING = {"TBS": "TBS", "文化放送": "QRR", "NHK-FM": "JOAK-FM", "NHK AM（東京）": "JOAK"}
@@ -72,6 +72,7 @@ class FakeManager:
         self.area_id = "JP13"
         self.segments = segments
         self.reservations = list(reservations)
+        self.schedules = {}
         self.calls = []
 
     def _ensure_authenticated(self):
@@ -93,10 +94,22 @@ class FakeManager:
     def load_reservations(self):
         return self.reservations
 
+    def load_cached_schedule(self, station_name):
+        return self.schedules.get(station_name)
+
 
 def _collector(tmp_path, segments, busy=lambda: None, reservations=()):
     manager = FakeManager(tmp_path, segments, reservations)
     return FingerprintCollector(manager, busy, tmp_path / "logs"), manager
+
+
+def _fetch(collector, chunk, stop_event=None):
+    """取得から解析までを1件通す"""
+    stop_event = stop_event or cmfp.threading.Event()
+    job = collector._download_chunk(chunk, stop_event)
+    if job['result'] != 'done':
+        return job
+    return collector._analyze_chunk(job, stop_event)
 
 
 def _chunk(seconds, bday=date(2026, 10, 29), hour=13):
@@ -187,7 +200,7 @@ def test_fp_file_round_trip(tmp_path):
 def test_fetch_chunk_saves_fingerprint_and_stats(tmp_path):
     collector, manager = _collector(tmp_path, _aac_segments(12))
     chunk = _chunk(12)
-    outcome = collector._fetch_chunk(chunk, cmfp.threading.Event())
+    outcome = _fetch(collector, chunk)
     assert outcome['result'] == 'done'
     assert outcome['audio_seconds'] == pytest.approx(12, abs=0.5)
     fp = read_fp_file(collector.fp_path("TBS", chunk['bday'], chunk['hour']))
@@ -195,7 +208,7 @@ def test_fetch_chunk_saves_fingerprint_and_stats(tmp_path):
     stats = [json.loads(l) for l in (tmp_path / "logs" / "fingerprint_stats.jsonl").read_text("utf-8").splitlines()]
     assert stats[-1]['result'] == 'done'
     assert stats[-1]['segments'] == 3
-    assert manager.calls[0][3] == 4
+    assert manager.calls[0][3] == cmfp.FETCH_PARALLEL_SPLITS
     assert not collector.audio_path("TBS", chunk['bday'], chunk['hour']).exists()
 
 
@@ -203,13 +216,13 @@ def test_fetch_chunk_keeps_audio_when_enabled(tmp_path):
     collector, _ = _collector(tmp_path, _aac_segments(6))
     collector.update_settings({'cm_fp_keep_audio': True})
     chunk = _chunk(6)
-    assert collector._fetch_chunk(chunk, cmfp.threading.Event())['result'] == 'done'
+    assert _fetch(collector, chunk)['result'] == 'done'
     assert collector.audio_path("TBS", chunk['bday'], chunk['hour']).stat().st_size > 0
 
 
 def test_fetch_chunk_fails_when_audio_is_short(tmp_path):
     collector, _ = _collector(tmp_path, _aac_segments(6))
-    outcome = collector._fetch_chunk(_chunk(60), cmfp.threading.Event())
+    outcome = _fetch(collector, _chunk(60))
     assert outcome['result'] == 'failed'
     assert "足りません" in outcome['error']
 
@@ -223,7 +236,7 @@ def test_fetch_chunk_aborts_when_recording_starts(tmp_path):
 
     collector, _ = _collector(tmp_path, _aac_segments(12), busy=busy_reason)
     chunk = _chunk(12)
-    assert collector._fetch_chunk(chunk, cmfp.threading.Event())['result'] == 'paused'
+    assert collector._download_chunk(chunk, cmfp.threading.Event())['result'] == 'paused'
     assert not collector.fp_path("TBS", chunk['bday'], chunk['hour']).exists()
 
 
@@ -239,11 +252,9 @@ def test_chunk_is_retried_after_recording_ends(tmp_path, monkeypatch):
     collector, manager = _collector(tmp_path, _aac_segments(12), busy=busy_reason)
     # 期限切れの判定は実際の現在時刻で行うため、チャンクは前日のものにする
     chunk = _chunk(12, bday=(datetime.now() - timedelta(days=1)).date())
-    index = {}
-    result = collector._process_chunk_with_pause(chunk, index, cmfp.threading.Event(), 0, 1)
-    assert result == 'done'
+    job = collector._download_with_pause(chunk, cmfp.threading.Event(), 0, 1)
+    assert job['result'] == 'done'
     assert len(manager.calls) == 2
-    assert index[chunk['key']]['status'] == 'done'
 
 
 def test_failed_chunk_gives_up_after_max_attempts(tmp_path):
@@ -281,3 +292,122 @@ def test_run_with_no_target_stations(tmp_path):
     collector.start_run("テスト")
     collector._thread.join(timeout=10)
     assert collector.get_status()['message'] == "対象の局がありません"
+
+
+def test_analysis_finishes_even_if_recording_starts_after_download(tmp_path):
+    """取得を終えた分は、録音が始まっても捨てずに解析を続ける"""
+    busy = {'reason': None}
+    collector, _ = _collector(tmp_path, _aac_segments(6), busy=lambda: busy['reason'])
+    chunk = _chunk(6)
+    job = collector._download_chunk(chunk, cmfp.threading.Event())
+    busy['reason'] = "オンタイム録音中"
+    assert collector._analyze_chunk(job, cmfp.threading.Event())['result'] == 'done'
+    assert collector.fp_path("TBS", chunk['bday'], chunk['hour']).exists()
+
+
+def test_plan_rotates_stations_so_none_is_always_last():
+    """同じ時刻の中の局の順番を時間ごとに回す（固定すると後ろの局だけ期限切れになる）"""
+    stations = ["TBS", "文化放送"]
+    chunks, _ = plan_chunks(stations, MAPPING, {}, datetime(2026, 10, 30, 6, 0), 11, 13)
+    first_by_hour = {}
+    for chunk in chunks:
+        first_by_hour.setdefault((chunk['bday'], chunk['hour']), chunk['station'])
+    assert set(first_by_hour.values()) == set(stations)
+
+
+def test_reserved_hours_expands_one_hour_and_uses_broadcast_hours():
+    reservations = [
+        {'station': "TBS", 'start': "11:00", 'end': "12:50"},
+        {'station': "TBS", 'start': "01:00", 'end': "02:00"},
+        {'station': "文化放送", 'start': "23:30", 'end': "00:30", 'enabled': False},
+    ]
+    hours = reserved_hours(reservations, ["TBS", "文化放送"])
+    assert hours == {"TBS": {10, 11, 12, 13, 24, 25, 26}}
+
+
+def test_plan_takes_reserved_hours_first():
+    chunks, _ = plan_chunks(
+        ["TBS"], MAPPING, {}, datetime(2026, 10, 30, 6, 0), 11, 27, reserved={"TBS": {20}}
+    )
+    assert [c['hour'] for c in chunks[:7]] == [20] * 7
+    assert chunks[7]['hour'] != 20
+    assert [c['bday'] for c in chunks[:7]] == sorted(c['bday'] for c in chunks[:7])
+
+
+def test_off_air_windows_picks_titles_from_schedule():
+    programs = [
+        {'date_iso': "2026-10-25", 'start': "01:00", 'end': "03:00", 'title': "放送休止"},
+        {'date_iso': "2026-10-25", 'start': "03:00", 'end': "05:00", 'title': "休止中(PART1)"},
+        {'date_iso': "2026-10-25", 'start': "22:00", 'end': "23:00", 'title': "放送機器メンテナンスのため放送休止"},
+        {'date_iso': "2026-10-25", 'start': "12:00", 'end': "13:00", 'title': "お昼の番組"},
+    ]
+    windows = off_air_windows(programs)
+    assert len(windows) == 3
+    # 0-4時台は放送日の翌カレンダー日
+    assert windows[0] == (datetime(2026, 10, 26, 1, 0), datetime(2026, 10, 26, 3, 0))
+
+
+def test_off_air_overlap_merges_adjacent_windows():
+    start = datetime(2026, 10, 26, 1, 0)
+    windows = [
+        (datetime(2026, 10, 26, 1, 30), datetime(2026, 10, 26, 1, 40)),
+        (datetime(2026, 10, 26, 1, 40), datetime(2026, 10, 26, 2, 30)),
+        (datetime(2026, 10, 26, 3, 0), datetime(2026, 10, 26, 4, 0)),
+    ]
+    assert off_air_overlap(windows, start, start + timedelta(hours=1)) == [[1800, 3600]]
+
+
+def test_plan_skips_hours_that_are_off_air():
+    """1時間まるごと休止なら取らず、一部だけ休止なら範囲を添えて取る"""
+    windows = [(datetime(2026, 10, 30, 1, 30), datetime(2026, 10, 30, 3, 0))]
+    chunks, counts = plan_chunks(
+        ["TBS"], MAPPING, {}, datetime(2026, 10, 30, 6, 0), 11, 27, off_air={"TBS": windows}
+    )
+    day = [c for c in chunks if c['bday'] == date(2026, 10, 29)]
+    assert 26 not in [c['hour'] for c in day]
+    assert counts['off_air'] == 1
+    assert next(c for c in day if c['hour'] == 25)['off_air'] == [[1800, 3600]]
+
+
+def test_partial_off_air_is_kept_in_index(tmp_path):
+    collector, _ = _collector(tmp_path, [])
+    chunk = {**_chunk(60), 'off_air': [[1800, 3600]]}
+    index = {}
+    collector._record_outcome(chunk, index, {'result': 'done', 'frames': 1, 'audio_seconds': 60})
+    assert index[chunk['key']]['off_air'] == [[1800, 3600]]
+
+
+def test_run_downloads_and_analyzes_every_planned_chunk(tmp_path, monkeypatch):
+    monkeypatch.setattr(cmfp, "MIN_AUDIO_RATIO", 0)
+    collector, manager = _collector(
+        tmp_path, _aac_segments(6), reservations=[{'station': "TBS", 'start': "11:00", 'end': "12:00"}]
+    )
+    collector.update_settings({'cm_fp_window_start': 11, 'cm_fp_window_end': 12})
+    collector.start_run("テスト")
+    collector._thread.join(timeout=60)
+    assert not collector.is_running()
+    index = collector.load_index()
+    assert len(manager.calls) == len(index) > 0
+    assert all(entry['status'] == 'done' for entry in index.values())
+    status = collector.get_status()
+    assert status['state'] == 'idle' and status['done'] == len(index)
+    assert status['message'].startswith("完了")
+
+
+def test_run_does_not_retry_failed_chunk_in_same_run(tmp_path, monkeypatch):
+    """失敗したチャンクは同じ実行の中で取り直さず、次の実行に回す"""
+    monkeypatch.setattr(cmfp, "FAILURE_BACKOFF_SECONDS", 0)
+    collector, manager = _collector(
+        tmp_path, [], reservations=[{'station': "TBS", 'start': "11:00", 'end': "12:00"}]
+    )
+
+    def fail(*a, **k):
+        raise RuntimeError("通信エラー")
+
+    manager._get_timefree_playlist_url = fail
+    collector.update_settings({'cm_fp_window_start': 11, 'cm_fp_window_end': 12})
+    collector.start_run("テスト")
+    collector._thread.join(timeout=60)
+    assert not collector.is_running()
+    index = collector.load_index()
+    assert index and all(e['status'] == 'pending' and e['attempts'] == 1 for e in index.values())
