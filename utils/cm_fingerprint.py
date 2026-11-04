@@ -84,6 +84,10 @@ MIN_AUDIO_RATIO = 0.9
 # （1時間分が約10分）。radikoの負荷を考えて、通常のタイムフリー取得3件分（12接続）より
 # 控えめにしている
 FETCH_PARALLEL_SPLITS = 6
+# 中断した区間の続きは、最後に取れたセグメントの開始のこの秒数後から取る。セグメントの
+# 長さ（5秒）ちょうどにすると、境目が少しずれたときに1つ取りこぼすため、重なる側に寄せる
+# （重なって載った取得済みのセグメントは捨てる）
+RESUME_OFFSET_SECONDS = 1
 # 解析待ちにできるチャンク数（1件あたり約22MB。これを超えると取得側が待つ）
 ANALYSIS_QUEUE_SIZE = 2
 # 番組表で放送休止を表す番組名（「放送休止」「放送休止中」「休止中(PART1)」
@@ -701,12 +705,13 @@ class FingerprintCollector:
         return True
 
     def _download_with_pause(self, chunk, stop_event, done, total):
-        """1チャンクを取得する。録音が始まって中断した場合は、終わるのを待って取り直す
+        """1チャンクを取得する。録音が始まって中断した場合は、終わるのを待って続きから取り直す
 
         Returns:
             dict: _download_chunk の結果（'result' は 'done' / 'failed' / 'stopped' / 'expired'）
         """
         label = chunk_label(chunk)
+        partial = None
         while True:
             if not self._wait_while_busy(stop_event, label):
                 return {'result': 'stopped'}
@@ -714,9 +719,10 @@ class FingerprintCollector:
                 self.log.info(f"期限切れのため飛ばします: {label}")
                 return {'result': 'expired'}
             self._set_status(state='running', message=f"取得中: {label}（{done + 1}/{total}件目）")
-            job = self._download_chunk(chunk, stop_event)
+            job = self._download_chunk(chunk, stop_event, partial)
             if job['result'] != 'paused':
                 return job
+            partial = job['partial']
 
     def _record_outcome(self, chunk, index, outcome):
         """結果を index に記録して保存する（呼び出し側で _index_lock を取ること）"""
@@ -742,12 +748,15 @@ class FingerprintCollector:
                 self.log.warning(f"{chunk_label(chunk)}: {attempts}回失敗したため、このチャンクは諦めます")
         self._save_index(index)
 
-    def _download_chunk(self, chunk, stop_event):
+    def _download_chunk(self, chunk, stop_event, partial=None):
         """1チャンク（1時間）をタイムフリーで取得する（音声はメモリに持つだけで解析はしない）
+
+        1時間を FETCH_PARALLEL_SPLITS 個の区間に分けて並列に取る。partial は、前回
+        録音で中断したときに返した区間ごとの取得状況で、渡すとその続きから取る。
 
         Returns:
             dict: {'result': 'done'|'failed'|'paused'|'stopped', ...}。'done' なら解析用に
-            'chunk', 'segments', 'stats' を含む
+            'chunk', 'segments', 'stats' を、'paused' なら続きを取るための 'partial' を含む
         """
         log = self.log
         station_id = chunk['station_id']
@@ -760,19 +769,64 @@ class FingerprintCollector:
             'attempt': chunk['attempts'] + 1, 'version': FP_VERSION,
             'splits': FETCH_PARALLEL_SPLITS,
         }
-        log.info(f"チャンク開始: {label} [{stats['ft']}-{stats['to']}] {stats['attempt']}回目")
+        if partial is None:
+            partial = [
+                {'start': start, 'end': end, 'last_dt': None, 'segments': [], 'done': False}
+                for start, end in self.manager._split_time_range(ft_dt, to_dt, FETCH_PARALLEL_SPLITS)
+            ]
+        held = sum(len(r['segments']) for r in partial)
+        stats['resumed_segments'] = held
+        if held:
+            log.info(f"チャンク再開: {label} 取得済み{held}セグメントの続きから {stats['attempt']}回目")
+        else:
+            log.info(f"チャンク開始: {label} [{stats['ft']}-{stats['to']}] {stats['attempt']}回目")
 
         wall_start = time.monotonic()
-        segments = []
-        abort = None
+        abort = {}
         error = None
-        segment_iter = None
-        progress = {'done': 0, 'total': 0}
-        chunk_stop = threading.Event()
-        last_progress_log = time.monotonic()
+        lock = threading.Lock()
+        last_progress_log = [time.monotonic()]
 
-        def on_progress(done, total):
-            progress['done'], progress['total'] = done, total
+        # 区間ごとの取り始めの時刻。開始時刻が分からないセグメントがあった区間は、
+        # どこまで取れたか分からないので最初から取り直す
+        todo = []
+        for r in partial:
+            if r['done']:
+                continue
+            if r.pop('unknown_dt', False):
+                r['segments'], r['last_dt'] = [], None
+            from_dt = r['start'] if r['last_dt'] is None else r['last_dt'] + timedelta(seconds=RESUME_OFFSET_SECONDS)
+            if from_dt >= r['end']:
+                r['done'] = True
+                continue
+            todo.append((r, from_dt))
+
+        def on_segment(idx, seg_dt, data):
+            r = todo[idx][0]
+            with lock:
+                if seg_dt is not None and r['last_dt'] is not None and seg_dt <= r['last_dt']:
+                    return  # 続きから取り直した直後は、取得済みのセグメントがもう一度載ることがある
+                r['segments'].append(data)
+                if seg_dt is None:
+                    r['unknown_dt'] = True
+                else:
+                    r['last_dt'] = seg_dt
+
+        def should_stop():
+            if stop_event.is_set():
+                abort['result'] = 'stopped'
+                return True
+            busy = self.busy_reason()
+            if busy:
+                abort['result'] = 'paused'
+                abort['reason'] = busy
+                return True
+            if time.monotonic() - last_progress_log[0] >= 60:
+                last_progress_log[0] = time.monotonic()
+                with lock:
+                    got = sum(len(r['segments']) for r in partial)
+                log.debug(f"取得中 {label}: {got}件 経過{time.monotonic() - wall_start:.0f}秒")
+            return False
 
         try:
             t0 = time.monotonic()
@@ -783,43 +837,33 @@ class FingerprintCollector:
                 raise RuntimeError("タイムフリーのプレイリストURLが取得できませんでした")
             log.debug(f"認証・プレイリストURL取得 {stats['auth_seconds']}秒 area={self.manager.area_id}")
 
-            segment_iter = self.manager._iter_timefree_segments_parallel(
-                playlist_base_url, station_id, auth_token, ft_dt, to_dt, chunk_stop,
-                on_progress=on_progress, num_splits=FETCH_PARALLEL_SPLITS,
-            )
-            for seg in segment_iter:
-                if stop_event.is_set():
-                    abort = 'stopped'
-                    break
-                busy = self.busy_reason()
-                if busy:
-                    abort = 'paused'
-                    log.info(f"中断: {busy}（{label}、{len(segments)}セグメント取得済みを破棄）")
-                    break
-                segments.append(seg)
-                if time.monotonic() - last_progress_log >= 60:
-                    last_progress_log = time.monotonic()
-                    log.debug(
-                        f"取得中 {label}: {progress['done']}/{progress['total']}件 "
-                        f"経過{time.monotonic() - wall_start:.0f}秒"
-                    )
+            if todo:
+                outcomes = self.manager._fetch_timefree_ranges_parallel(
+                    playlist_base_url, station_id, auth_token, [(f, r['end']) for r, f in todo],
+                    threading.Event(), on_segment, should_stop=should_stop, log=log,
+                )
+                for (r, _), outcome in zip(todo, outcomes):
+                    if outcome == 'done':
+                        r['done'] = True
+                    elif isinstance(outcome, Exception) and error is None:
+                        error = f"{type(outcome).__name__}: {outcome}"
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             log.exception(f"取得エラー: {label}")
-        finally:
-            chunk_stop.set()
-            if segment_iter is not None:
-                segment_iter.close()
 
+        segments = [seg for r in partial for seg in r['segments']]
         wall = time.monotonic() - wall_start
         stats.update({
             'segments': len(segments), 'segment_bytes': sum(len(s) for s in segments),
             'download_seconds': round(wall, 1),
         })
-        if abort:
-            stats['result'] = abort
+        if abort and not error:
+            stats['result'] = abort['result']
             self._write_stats(stats)
-            return {'result': abort}
+            if abort['result'] == 'paused':
+                log.info(f"中断: {abort['reason']}（{label}、{len(segments)}セグメント取得済み。続きから取り直します）")
+                return {'result': 'paused', 'partial': partial}
+            return {'result': 'stopped'}
         if error:
             stats['result'] = 'failed'
             stats['error'] = error

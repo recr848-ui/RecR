@@ -12,6 +12,7 @@ from utils.cm_fingerprint import (
     FingerprintBuilder, FingerprintCollector, off_air_overlap, off_air_windows, plan_chunks,
     read_fp_file, reserved_hours, target_stations, write_fp_file,
 )
+from utils.radiko_manager import RadikoManager
 
 MAPPING = {"TBS": "TBS", "文化放送": "QRR", "NHK-FM": "JOAK-FM", "NHK AM（東京）": "JOAK"}
 
@@ -74,6 +75,8 @@ class FakeManager:
         self.reservations = list(reservations)
         self.schedules = {}
         self.calls = []
+        self.base_dt = None
+        self.delivered = 0
 
     def _ensure_authenticated(self):
         return "token"
@@ -81,15 +84,37 @@ class FakeManager:
     def _get_timefree_playlist_url(self, station_id):
         return "https://example.invalid/playlist"
 
-    def _iter_timefree_segments_parallel(self, base, station_id, token, ft_dt, to_dt, stop_event,
-                                         on_progress=None, num_splits=4):
-        self.calls.append((station_id, ft_dt, to_dt, num_splits))
-        for i, seg in enumerate(self.segments):
+    _split_time_range = RadikoManager._split_time_range
+
+    def _fetch_timefree_ranges_parallel(self, base, station_id, token, ranges, stop_event, on_segment,
+                                        should_stop=None, log=None):
+        """セグメント i は放送開始の 5*i 秒後のものとして、区間に入るものを順に渡す
+
+        続きから取り直したとき（最初の分割の境目以外から取るとき）は、本物と同じく
+        取り始めの1秒前までに始まる取得済みのセグメントも載せる
+        """
+        self.calls.append((station_id, ranges[0][0], ranges[-1][1], len(ranges)))
+        if self.base_dt is None:
+            self.base_dt = ranges[0][0]
+            self.split_starts = {start for start, _ in ranges}
+        outcomes = []
+        for from_dt, to_dt in ranges:
+            if from_dt not in self.split_starts:
+                from_dt -= timedelta(seconds=1)
             if stop_event.is_set():
-                return
-            if on_progress:
-                on_progress(i + 1, len(self.segments))
-            yield seg
+                outcomes.append('stopped')
+                continue
+            for i, seg in enumerate(self.segments):
+                seg_dt = self.base_dt + timedelta(seconds=5 * i)
+                if not (from_dt <= seg_dt < to_dt):
+                    continue
+                on_segment(len(outcomes), seg_dt, seg)
+                self.delivered += 1
+                if should_stop is not None and should_stop():
+                    stop_event.set()
+                    break
+            outcomes.append('stopped' if stop_event.is_set() else 'done')
+        return outcomes
 
     def load_reservations(self):
         return self.reservations
@@ -255,6 +280,9 @@ def test_chunk_is_retried_after_recording_ends(tmp_path, monkeypatch):
     job = collector._download_with_pause(chunk, cmfp.threading.Event(), 0, 1)
     assert job['result'] == 'done'
     assert len(manager.calls) == 2
+    # 中断までに取れた分は捨てずに、続きだけを取り直す
+    assert job['segments'] == manager.segments
+    assert job['stats']['resumed_segments'] == 1
 
 
 def test_failed_chunk_gives_up_after_max_attempts(tmp_path):

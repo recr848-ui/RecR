@@ -695,6 +695,46 @@ def test_iter_timefree_segments_resumes_from_where_session_expired(manager, monk
     assert len(sessions) == 2
 
 
+def test_fetch_timefree_ranges_parallel_reports_each_range(manager, monkeypatch):
+    """区間ごとに、取れたセグメントを開始時刻つきで渡し、最後まで取れたかを返す"""
+    import threading
+
+    logs = []
+
+    def fake_iter(url, headers, stop_event, to_dt, renew_playlist_url=None, log=None, with_times=False):
+        assert with_times
+        logs.append(log)
+        from_dt = datetime.strptime(url.split("ft=")[1][:14], "%Y%m%d%H%M%S")
+        while from_dt < to_dt and not stop_event.wait(0.01):
+            yield from_dt, f"{from_dt:%H%M%S}".encode()
+            from_dt += timedelta(seconds=5)
+
+    monkeypatch.setattr(manager, "_iter_timefree_segments", fake_iter)
+    got = []
+    lock = threading.Lock()
+
+    def on_segment(idx, seg_dt, data):
+        with lock:
+            got.append((idx, data))
+
+    ranges = [(_TF_BASE, _TF_BASE + timedelta(seconds=10)),
+              (_TF_BASE + timedelta(seconds=10), _TF_BASE + timedelta(seconds=20))]
+    outcomes = manager._fetch_timefree_ranges_parallel(
+        "http://x/playlist", "TBS", "token", ranges, threading.Event(), on_segment, log="fp-log",
+    )
+    assert outcomes == ['done', 'done']
+    assert sorted(got) == [(0, b"193000"), (0, b"193005"), (1, b"193010"), (1, b"193015")]
+    assert logs == ["fp-log", "fp-log"]
+
+    # 終わらない区間でも、should_stop が True を返せば止まる
+    endless = [(_TF_BASE, _TF_BASE + timedelta(days=1))]
+    outcomes = manager._fetch_timefree_ranges_parallel(
+        "http://x/playlist", "TBS", "token", endless, threading.Event(), lambda *a: None,
+        should_stop=lambda: True,
+    )
+    assert outcomes == ['stopped']
+
+
 def test_iter_timefree_segments_fails_when_it_cannot_resume(manager, monkeypatch):
     """取り直しても進まない（取り直した先も404）なら、途中までを成功扱いにせず例外にする"""
     import pytest

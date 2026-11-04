@@ -1387,17 +1387,8 @@ class RadikoManager:
             return sub_progress
 
         def worker(idx, sub_ft_dt, sub_to_dt):
-            to_str = sub_to_dt.strftime("%Y%m%d%H%M%S")
-
             def build_playlist_url(from_dt):
-                # セッション（lsid）ごとに別のURLにする。通信断でセッションが切れた
-                # ときは、続きの時刻を from_dt にして同じ形で作り直す
-                lsid = uuid.uuid4().hex
-                ft_str = from_dt.strftime("%Y%m%d%H%M%S")
-                return (
-                    f"{playlist_base_url}?station_id={station_id}&start_at={ft_str}&ft={ft_str}"
-                    f"&end_at={to_str}&to={to_str}&l=15&lsid={lsid}&type=b"
-                )
+                return self._timefree_range_playlist_url(playlist_base_url, station_id, from_dt, sub_to_dt)
 
             headers = {"X-Radiko-AuthToken": auth_token}
             try:
@@ -1436,13 +1427,76 @@ class RadikoManager:
             for t in threads:
                 t.join(timeout=5)
 
+    @staticmethod
+    def _timefree_range_playlist_url(playlist_base_url, station_id, from_dt, to_dt):
+        """from_dt〜to_dt を取得するタイムフリーのプレイリストURL
+
+        セッション（lsid）ごとに別のURLにする。通信断でセッションが切れたときや、
+        中断した続きを取るときは、続きの時刻を from_dt にして作り直す
+        """
+        lsid = uuid.uuid4().hex
+        ft_str = from_dt.strftime("%Y%m%d%H%M%S")
+        to_str = to_dt.strftime("%Y%m%d%H%M%S")
+        return (
+            f"{playlist_base_url}?station_id={station_id}&start_at={ft_str}&ft={ft_str}"
+            f"&end_at={to_str}&to={to_str}&l=15&lsid={lsid}&type=b"
+        )
+
+    def _fetch_timefree_ranges_parallel(self, playlist_base_url, station_id, auth_token, ranges,
+                                        stop_event, on_segment, should_stop=None, log=None):
+        """ranges（[(ft_dt, to_dt), ...]）をそれぞれ別セッションで並列に取得する
+
+        _iter_timefree_segments_parallel と違い、取得した順に
+        on_segment(区間番号, セグメントの開始時刻, データ) を呼ぶ（取得スレッドから呼ばれる）。
+        区間ごとにどこまで取れたかを呼び出し側が持てるので、途中で止めても続きから取り直せる。
+        すべての区間が終わるか stop_event がセットされるまで戻らない。should_stop を渡すと
+        約1秒ごとに呼び、True を返したら stop_event をセットして止める。
+
+        Returns:
+            list: 区間ごとの結果（'done' 最後まで取れた / 'stopped' 途中で止めた / 取得中の例外）
+        """
+        outcomes = ['stopped'] * len(ranges)
+
+        def worker(idx, sub_ft_dt, sub_to_dt):
+            def build_playlist_url(from_dt):
+                return self._timefree_range_playlist_url(playlist_base_url, station_id, from_dt, sub_to_dt)
+
+            headers = {"X-Radiko-AuthToken": auth_token}
+            try:
+                for seg_dt, data in self._iter_timefree_segments(
+                    build_playlist_url(sub_ft_dt), headers, stop_event, sub_to_dt,
+                    renew_playlist_url=build_playlist_url, log=log, with_times=True,
+                ):
+                    on_segment(idx, seg_dt, data)
+                if not stop_event.is_set():
+                    outcomes[idx] = 'done'
+            except Exception as e:
+                outcomes[idx] = e
+
+        threads = [
+            threading.Thread(target=worker, args=(i, r[0], r[1]), daemon=True)
+            for i, r in enumerate(ranges)
+        ]
+        for t in threads:
+            t.start()
+        try:
+            while any(t.is_alive() for t in threads):
+                next(t for t in threads if t.is_alive()).join(timeout=1)
+                if should_stop is not None and not stop_event.is_set() and should_stop():
+                    stop_event.set()
+        finally:
+            stop_event.set()
+            for t in threads:
+                t.join(timeout=5)
+        return outcomes
+
     # タイムフリーの取得がこの秒数以内まで to_dt に迫っていれば、medialistの404や
     # 新規セグメントの枯渇を「番組の終わりに達した」とみなす。これより手前で
     # 起きた場合は途中で切れたものとして扱う
     TIMEFREE_END_TOLERANCE_SECONDS = 15
 
     def _iter_timefree_segments(self, playlist_url, headers, stop_event, to_dt, on_progress=None,
-                                renew_playlist_url=None):
+                                renew_playlist_url=None, log=None, with_times=False):
         """タイムフリープレイリストの全セグメント(生のAACバイト列)を順に生成するジェネレーター。
 
         タイムフリーのmedialistは、1回の取得ではプレイリストURLのl(秒数)パラメータ分の
@@ -1467,7 +1521,12 @@ class RadikoManager:
         セグメント取得のたびに呼ばれる進捗コールバック（total_estimateはft〜to間の
         推定セグメント数で、実際の総数とは多少ずれることがある）。バックグラウンドスレッドから
         呼ばれる。
+
+        log: ログの出力先（指紋取得のように本体のログに出したくない場合に渡す）。
+        with_times が True なら、(セグメントの開始時刻, データ) の組を生成する
+        （開始時刻が分からないセグメントは None）。
         """
+        log = log or logger
         session = requests.Session()
 
         def open_session(url):
@@ -1520,7 +1579,7 @@ class RadikoManager:
                     # CDN側のセッションには寿命があるらしく、番組の終端付近で
                     # medialistが404になることがある（実機で確認済み）。末尾まで
                     # 到達していれば正常終了とする。
-                    logger.info(
+                    log.info(
                         f"タイムフリー: medialistが404になりました（done={done}件）。"
                         "セッション終了とみなして完了とします"
                     )
@@ -1531,7 +1590,7 @@ class RadikoManager:
                 # 取り直しても1件も進まないまま再び404なら諦める
                 if renew_playlist_url is None or done == done_at_last_renewal:
                     media_res.raise_for_status()
-                logger.warning(
+                log.warning(
                     f"タイムフリー: medialistが404になったため、続きからセッションを取り直します"
                     f"（done={done}件、残り約{remaining:.0f}秒）"
                 )
@@ -1551,7 +1610,7 @@ class RadikoManager:
                 if stall_count >= 10:
                     remaining = remaining_seconds()
                     if remaining is not None and remaining > self.TIMEFREE_END_TOLERANCE_SECONDS:
-                        logger.warning(
+                        log.warning(
                             f"タイムフリー: {stall_count}回連続で新規セグメントを取得できず中断しました "
                             f"(last_sequence={last_sequence}、残り約{remaining:.0f}秒)"
                         )
@@ -1559,7 +1618,7 @@ class RadikoManager:
                             f"タイムフリーの取得が途中で止まりました（残り約{remaining:.0f}秒）"
                         )
                     # 区間の終わりまで取り終えた後、続きが無いことを確かめて抜けただけ（正常終了）
-                    logger.info(
+                    log.info(
                         f"タイムフリー: 区間の終わりまで取得しました（以降の新規セグメントなし、"
                         f"last_sequence={last_sequence}）"
                     )
@@ -1610,10 +1669,10 @@ class RadikoManager:
                 if seg_res is None:
                     return
                 if seg_res.status_code == 200:
-                    yield seg_res.content
+                    yield (seg_dt, seg_res.content) if with_times else seg_res.content
                 else:
                     failed_count += 1
-                    logger.warning(
+                    log.warning(
                         f"タイムフリーセグメント取得失敗: status={seg_res.status_code} url={seg_url}"
                     )
                 last_sequence = seq
@@ -1632,7 +1691,7 @@ class RadikoManager:
                 return
             time.sleep(max(target_duration / 2, 1))
 
-        logger.info(f"タイムフリー: セグメント取得完了 {done}件（失敗{failed_count}件）")
+        log.info(f"タイムフリー: セグメント取得完了 {done}件（失敗{failed_count}件）")
 
     def _playback_fetch_worker(self, playlist_url, auth_token, stop_event, buffer):
         """バックグラウンドスレッドでHLSストリームを取得・デコードし、PCMを
