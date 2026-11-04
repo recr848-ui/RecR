@@ -1092,6 +1092,8 @@ def test_same_reservation_does_not_take_over_itself(app, monkeypatch):
     stopped, started = _adjacent_reservations(app, monkeypatch, prior_id="next")
     app._check_due_reservations()
     assert stopped == [] and started == []
+    # 自分の録音なので「局が使用中のため見送り」とは記録しない
+    assert not app._busy_skip_logged
 
 
 def test_overlapping_reservation_does_not_cut_running_recording(app, monkeypatch):

@@ -3595,6 +3595,11 @@ class RecRApp:
                 started_any = True
                 continue
 
+            if self.manager.recording_reservation_id(station) == reservation['id']:
+                # この予約自身が録音中（実行済みの印は録音が終わってから付くため、
+                # 開始後も猶予時間のあいだはここに来る）
+                continue
+
             if self.manager.is_recording_active(station) and not self._hand_off_recording(
                 reservation, start_dt
             ):
@@ -5449,6 +5454,10 @@ def main():
         root.destroy()
         return
 
+    logger.info(
+        f"RecR Ver{RecRApp.APP_VERSION} を起動しました"
+        f"（{'exe' if getattr(sys, 'frozen', False) else 'Python ' + sys.version.split()[0]}）"
+    )
     root = tk.Tk()
     _install_exception_logging(root)
     app = RecRApp(root)
