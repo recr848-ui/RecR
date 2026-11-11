@@ -53,9 +53,20 @@ python src/main.py
 ```
 RecR/
 ├── src/
-│   └── main.py                 # メインアプリケーション（GUI）
+│   └── main.py                 # 起動処理とメインウィンドウ（RecRApp。gui/ の各機能を束ねる）
+├── gui/                        # GUIの機能別モジュール（タブ・メニュー・予約実行・トレイなど）
+│   ├── schedule_tab.py         #   例: 「番組表」タブ
+│   ├── reservation_runner.py   #   例: 予約録音の定期チェック・開始・再開
+│   └── ...
 ├── utils/
-│   ├── radiko_manager.py       # radiko ストリーム取得・録音・タイムフリー・番組表・予約管理
+│   ├── radiko_manager/         # radiko 関連（RadikoManager。機能別のモジュールを束ねる）
+│   │   ├── stream.py           #   ライブ・タイムフリーのストリーム取得
+│   │   ├── recording.py        #   録音・タイムフリーダウンロード
+│   │   ├── schedule.py         #   番組表の取得
+│   │   ├── storage.py          #   設定・予約・フリーワードの保存
+│   │   └── ...
+│   ├── radiru_manager.py       # NHK聴き逃し（らじる★らじる）
+│   ├── cm_fingerprint.py       # CMカット用フィンガープリント取得
 │   └── reservation_logic.py    # 予約の状態判定ロジック（タイムフリーリカバリー要否など）
 ├── tests/                      # pytest によるユニットテスト
 ├── config/

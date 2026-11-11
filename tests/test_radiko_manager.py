@@ -1,7 +1,9 @@
 import threading
+import time
 from datetime import datetime, timedelta
 
 import pytest
+import requests
 
 
 # --- _sanitize_filename ---------------------------------------------------
@@ -469,7 +471,6 @@ class _InstantEvent:
 
 
 def test_get_with_retry_recovers_from_transient_errors(manager):
-    import requests
 
     outcomes = [
         requests.exceptions.ReadTimeout("timed out"),
@@ -505,7 +506,6 @@ def test_get_with_retry_does_not_retry_client_errors(manager):
 
 def test_get_with_retry_gives_up_after_budget(manager, monkeypatch):
     import pytest
-    import requests
 
     monkeypatch.setattr(manager, "FETCH_RETRY_BUDGET_SECONDS", 0)
 
@@ -519,7 +519,6 @@ def test_get_with_retry_gives_up_after_budget(manager, monkeypatch):
 def test_get_with_retry_returns_none_when_stopped_while_waiting(manager):
     import threading
 
-    import requests
 
     stop_event = threading.Event()
 
@@ -532,9 +531,7 @@ def test_get_with_retry_returns_none_when_stopped_while_waiting(manager):
 
 def test_iter_live_segments_survives_single_medialist_failure(manager, monkeypatch):
     """medialistの取得が1回失敗しただけでは録音を打ち切らない"""
-    import requests
 
-    import utils.radiko_manager as radiko_manager
 
     polls = {"count": 0}
 
@@ -551,8 +548,8 @@ def test_iter_live_segments_survives_single_medialist_failure(manager, monkeypat
             ))
         return _FakeResponse(content=url.encode())
 
-    monkeypatch.setattr(radiko_manager.requests, "get", fake_get)
-    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
     segments = []
     for segment in manager._iter_live_segments("http://x/master.m3u8", {}, _InstantEvent()):
@@ -588,14 +585,13 @@ def _fake_live_get_with_expiring_session(expired_sessions):
 
 def test_iter_live_segments_renews_session_when_medialist_expires(manager, monkeypatch):
     """通信断のあいだにセッションが切れてmedialistが404になっても、取り直して続行する"""
-    import utils.radiko_manager as radiko_manager
 
     # 3回目のポーリング以降、最初のセッションは期限切れになる
     fake_get, state = _fake_live_get_with_expiring_session(
         lambda state: {1} if state["polls"] >= 3 else set()
     )
-    monkeypatch.setattr(radiko_manager.requests, "get", fake_get)
-    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
     segments = []
     for segment in manager._iter_live_segments("http://x/master.m3u8", {}, _InstantEvent()):
@@ -611,13 +607,11 @@ def test_iter_live_segments_renews_session_when_medialist_expires(manager, monke
 def test_iter_live_segments_gives_up_when_renewed_session_also_fails(manager, monkeypatch):
     """取り直したセッションも直後に4xxなら、無限に取り直さず例外にする"""
     import pytest
-    import requests
 
-    import utils.radiko_manager as radiko_manager
 
     fake_get, state = _fake_live_get_with_expiring_session(lambda state: {1, 2, 3, 4})
-    monkeypatch.setattr(radiko_manager.requests, "get", fake_get)
-    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
     with pytest.raises(requests.HTTPError):
         list(manager._iter_live_segments("http://x/master.m3u8", {}, _InstantEvent()))
@@ -641,7 +635,6 @@ def _install_fake_timefree_server(monkeypatch, expired_sessions):
     """
     from urllib.parse import parse_qs, urlparse
 
-    import utils.radiko_manager as radiko_manager
 
     sessions = {}
 
@@ -672,8 +665,8 @@ def _install_fake_timefree_server(monkeypatch, expired_sessions):
     class FakeSession:
         get = staticmethod(fake_get)
 
-    monkeypatch.setattr(radiko_manager.requests, "Session", FakeSession)
-    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
     return sessions
 
 
@@ -738,7 +731,6 @@ def test_fetch_timefree_ranges_parallel_reports_each_range(manager, monkeypatch)
 def test_iter_timefree_segments_fails_when_it_cannot_resume(manager, monkeypatch):
     """取り直しても進まない（取り直した先も404）なら、途中までを成功扱いにせず例外にする"""
     import pytest
-    import requests
 
     _install_fake_timefree_server(monkeypatch, expired_sessions={1, 2, 3})
 
@@ -768,7 +760,6 @@ def test_iter_timefree_segments_treats_404_near_the_end_as_complete(manager, mon
 
 def _install_stalling_timefree_server(monkeypatch, segment_count):
     """medialistが毎回同じ segment_count 件（5秒刻み）だけを返し、それ以上進まない配信"""
-    import utils.radiko_manager as radiko_manager
 
     def fake_get(url, headers=None, timeout=None):
         if "/playlist" in url:
@@ -785,8 +776,8 @@ def _install_stalling_timefree_server(monkeypatch, segment_count):
     class FakeSession:
         get = staticmethod(fake_get)
 
-    monkeypatch.setattr(radiko_manager.requests, "Session", FakeSession)
-    monkeypatch.setattr(radiko_manager.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
 
 def test_iter_timefree_segments_stall_at_the_end_is_logged_as_info(manager, monkeypatch, caplog):

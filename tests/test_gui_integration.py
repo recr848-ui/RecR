@@ -50,7 +50,7 @@ def app(monkeypatch, tmp_path, shared_root):
     monkeypatch.setattr(
         RadikoManager, "get_sample_schedule", lambda self, station, days=10: []
     )
-    monkeypatch.setattr(RadikoManager, "get_timefree_schedule", lambda self, station: [])
+    monkeypatch.setattr(RadikoManager, "get_timefree_schedule", lambda self, station, **kwargs: [])
     # messagebox系は全部モックする。showwarning等を1つでも生で残すと、
     # 起動時の _refresh_stale_stations 等から本物のポップアップダイアログが
     # 実際の画面上に表示されてしまう（実際に一度これで表示させてしまった）
@@ -408,7 +408,7 @@ def test_timefree_schedule_refetches_when_cache_is_entirely_out_of_window(app, m
         'date': '9/18(金)', 'date_iso': '2026-09-18', 'start': '05:00', 'end': '06:00',
         'title': '再取得された新しい番組',
     }]
-    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda st: fresh_programs)
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda st, **kwargs: fresh_programs)
 
     def fail_if_called(*a, **k):
         raise AssertionError("取得しないと表示できないのに確認ダイアログを出した")
@@ -474,7 +474,7 @@ def test_full_schedule_refresh_also_refreshes_timefree_cache(app, monkeypatch):
     monkeypatch.setattr(
         app.manager, "get_program_schedule", lambda station, days=10: upcoming_programs
     )
-    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda station: timefree_programs)
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda station, **kwargs: timefree_programs)
     monkeypatch.setattr(app.manager, "scan_freewords_for_station", lambda station, programs: [])
 
     app._full_schedule_refresh_worker([station], today_iso)
@@ -540,7 +540,7 @@ def test_fetch_and_cache_schedule_also_refreshes_timefree_cache(app, monkeypatch
     monkeypatch.setattr(
         app.manager, "get_program_schedule", lambda station, days=10: upcoming_programs
     )
-    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda station: timefree_programs)
+    monkeypatch.setattr(app.manager, "get_timefree_schedule", lambda station, **kwargs: timefree_programs)
 
     app.fetch_and_cache_schedule(station)
 
@@ -560,7 +560,7 @@ def test_fetch_and_cache_schedule_ignores_timefree_fetch_failure(app, monkeypatc
         app.manager, "get_program_schedule", lambda station, days=10: upcoming_programs
     )
 
-    def raise_err(station):
+    def raise_err(station, **kwargs):
         raise RuntimeError("boom")
     monkeypatch.setattr(app.manager, "get_timefree_schedule", raise_err)
 

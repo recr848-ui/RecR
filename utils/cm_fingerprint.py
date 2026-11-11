@@ -39,7 +39,7 @@ from pathlib import Path
 
 from utils.app_logger import build_queued_handlers
 from utils.json_store import read_json, write_json_atomic
-from utils.radiko_manager import _spectrum_magnitudes
+from utils.radiko_manager.audio import _spectrum_magnitudes
 from utils.reservation_logic import program_air_window
 
 FP_VERSION = 1
