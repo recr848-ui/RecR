@@ -18,3 +18,10 @@ test_out*.mp3
 # Editor
 .vscode/*
 !.vscode/tasks.json
+
+# Claude Code local settings
+.claude/
+
+# Local scratch files
+enc*.bin
+*.code-workspace
