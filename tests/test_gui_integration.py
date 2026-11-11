@@ -15,6 +15,7 @@ Tkの実ウィンドウはテストごとに作り直すとTcl側の状態がま
 1つだけ生成して使い回す（各テストではその上にRecRAppを作り直し、
 ウィジェットだけ後始末する）。
 """
+import time
 import tkinter as tk
 from datetime import datetime, timedelta
 from tkinter import messagebox, ttk
@@ -506,6 +507,55 @@ def test_full_schedule_refresh_waits_for_startup_stale_refresh(app, monkeypatch)
     app._on_stale_refresh_done(dialog, False, [], [], today_iso)
     assert started == [True]
     assert app._stale_refresh_in_progress is False
+
+
+def test_station_fetch_worker_starts_only_after_event_loop_runs(app, monkeypatch):
+    """複数局の並列取得スレッドは、Tkのイベントループが回ってから開始すること。
+
+    以前は起動処理（mainloop開始前）の中でスレッドを開始しており、ワーカーが
+    root.after を呼んだ時点で「main thread is not in main loop」で落ちて、
+    進捗ダイアログが閉じなくなっていた
+    """
+    started = []
+    monkeypatch.setattr(
+        app, "_fetch_and_cache_schedule_no_ui",
+        lambda station, cancel_event: (started.append(station), (True, False, None))[1],
+    )
+    done = []
+
+    def on_done(*args):
+        done.append(args)
+        # ワーカースレッドが抜けきる（進捗用のTk変数が解放される）までループを回してから止める
+        app.root.after(300, app.root.quit)
+
+    app._fetch_stations_with_progress(["TBS"], "テスト", on_done)
+    time.sleep(0.2)
+    assert started == []
+
+    # 実アプリと同じく mainloop を回す（root.update() だけではワーカーの root.after が失敗する）
+    timeout_job = app.root.after(5000, app.root.quit)
+    app.root.mainloop()
+    app.root.after_cancel(timeout_job)
+    assert started == ["TBS"]
+    dialog, cancelled, failed, refreshed, any_created = done[0]
+    assert (cancelled, failed, refreshed, any_created) == (False, [], ["TBS"], False)
+    dialog.destroy()
+
+
+def test_load_schedule_skips_sync_fetch_while_startup_refresh_runs(app, monkeypatch):
+    """起動時の自動更新の実行中は、表示中の局にキャッシュが無くても同期取得しないこと
+    （自動更新側が同じ局を取得しており、完了時にあらためて表示されるため）"""
+    fetched = []
+    monkeypatch.setattr(app, "fetch_and_cache_schedule", lambda st: fetched.append(st) or ([], False))
+    monkeypatch.setattr(app.manager, "load_cached_schedule", lambda st: None)
+
+    app._stale_refresh_in_progress = True
+    app.load_schedule_for_current_station()
+    assert fetched == []
+
+    app._stale_refresh_in_progress = False
+    app.load_schedule_for_current_station()
+    assert fetched == [app.schedule_station_var.get()]
 
 
 def test_full_schedule_refresh_skips_stations_refreshed_at_startup(app):

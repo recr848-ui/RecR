@@ -134,7 +134,11 @@ class ScheduleRefreshMixin:
                 any_created
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        # ワーカーは root.after で進捗・完了を通知するが、Tkのイベントループ（mainloop）が
+        # 回り始める前に別スレッドから root.after を呼ぶと「main thread is not in main loop」
+        # で落ち、完了処理が呼ばれずダイアログが閉じなくなる（起動時の自動更新で実際に発生）。
+        # スレッドの開始自体をイベントループ上で行い、必ずループが回ってから動かす
+        self.root.after(0, lambda: threading.Thread(target=worker, daemon=True).start())
 
     def _close_schedule_fetch_progress_dialog(self, dialog, any_created):
         """進捗ダイアログを閉じ、取得結果を予約一覧・表示中の番組表に反映する"""

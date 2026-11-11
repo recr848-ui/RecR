@@ -226,6 +226,11 @@ class ScheduleTabMixin:
             self.display_schedule(cached)
             self._scroll_schedule_to_now()
             return
+        if self._stale_refresh_in_progress:
+            # 起動時の自動更新がキャッシュの無い局（＝この局も含む）を取得中。ここで同じ局を
+            # 同期取得すると二重取得になるうえ、その間メインスレッドが止まる。
+            # 自動更新の完了時（_on_stale_refresh_done）にあらためて表示される
+            return
 
         self._set_app_busy(True)
         try:
