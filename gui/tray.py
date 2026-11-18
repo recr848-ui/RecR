@@ -143,6 +143,7 @@ class TrayMixin:
             self.root.after_cancel(self._cm_fp_check_job)
             self._cm_fp_check_job = None
         self.cm_fp_collector.stop("アプリ終了", wait=3)
+        self.cm_chapterer.stop()
         self.manager.stop_playback()
         self.manager.stop_recording()
         self.manager.stop_all_downloads()

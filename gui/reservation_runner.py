@@ -334,6 +334,8 @@ class ReservationRunnerMixin:
         self._refresh_reservation_list()
         if hasattr(self, 'files_tree'):
             self._refresh_files_list()
+        if had_data:
+            self._request_cm_chapters(output_path)
 
         if not had_data:
             if interrupted_before:

@@ -29,6 +29,9 @@ class FilesTabMixin:
         ttk.Button(
             control_frame, text="削除", command=self._delete_selected_files
         ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            control_frame, text="CMチャプターを付ける", command=self._add_cm_chapters_to_files
+        ).pack(side=tk.LEFT, padx=5)
 
         self.files_dir_label = ttk.Label(parent, foreground="gray30", padding=(10, 0))
         self.files_dir_label.pack(fill=tk.X)
@@ -65,6 +68,8 @@ class FilesTabMixin:
         files = [
             f for f in output_dir.iterdir()
             if f.is_file() and f.suffix.lower() in self.AUDIO_FILE_EXTENSIONS
+            # 「.」で始まるのはCMチャプター付けの途中の一時ファイル
+            and not f.name.startswith(".")
         ]
         files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
@@ -99,6 +104,39 @@ class FilesTabMixin:
             self._refresh_files_list()
             return
         os.startfile(str(files[0]))
+
+    # 更新されてからこの秒数が経っていないファイルは、録音中かもしれないので対象にしない
+    CM_CHAPTER_MIN_IDLE_SECONDS = 60
+
+    def _add_cm_chapters_to_files(self):
+        """選択中のファイル（未選択なら保存先フォルダの m4a すべて）にCMチャプターを付ける"""
+        selection = self.files_tree.selection()
+        if selection:
+            files = [self._files_row_map[i] for i in selection if i in self._files_row_map]
+        else:
+            files = list(self._files_row_map.values())
+        now = datetime.now().timestamp()
+        targets = [
+            f for f in files
+            if f.suffix.lower() == ".m4a" and f.exists()
+            and now - f.stat().st_mtime >= self.CM_CHAPTER_MIN_IDLE_SECONDS
+        ]
+        if not targets:
+            messagebox.showinfo(
+                "CMチャプター", "CMチャプターを付けられるのは m4a のファイルだけです（録音中のものは除きます）。"
+            )
+            return
+        scope = f"選択した{len(targets)}件" if selection else f"保存先フォルダの m4a ファイル{len(targets)}件すべて"
+        if not messagebox.askyesno(
+            "CMチャプター",
+            f"{scope}にCMチャプターを付けますか？\n\n"
+            "音声はそのままで、チャプターの情報だけを書き込みます（元のファイルを置き換えます）。\n"
+            "CMの判定には、その局の前後の日の指紋（「設定」→「CMフィンガープリント取得」で集めたもの）を使います。\n"
+            "1件あたり数十秒かかり、1件ずつ順に処理します。進み具合は「CMフィンガープリント取得」の画面で確認できます。"
+        ):
+            return
+        for f in targets:
+            self.cm_chapterer.request(f, "手動")
 
     def _delete_selected_files(self):
         """選択中のファイルを削除する"""

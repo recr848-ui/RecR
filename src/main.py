@@ -22,6 +22,7 @@ import sv_ttk
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.app_logger import LOG_DIR, setup_logging
+from utils.cm_detect import CmChapterer
 from utils.cm_fingerprint import FingerprintCollector
 from utils.paths import get_base_dir
 from utils.radiko_manager import RadikoManager
@@ -176,6 +177,13 @@ class RecRApp(
         self.cm_fp_collector = FingerprintCollector(self.manager, self._cm_fp_busy_reason, LOG_DIR)
         self.cm_fp_collector.update_settings(settings)
         self._cm_fp_check_job = None
+        # 録音ファイルへのCMチャプター付け（録音直後と、放送から3日後にもう一度）
+        self.cm_chapterer = CmChapterer(
+            self.manager, LOG_DIR,
+            on_finished=lambda path, record: self.root.after(0, self._on_cm_chapters_finished, path, record),
+        )
+        self.cm_chapterer.update_settings(settings)
+        self._cm_chapter_due_checked = None
 
         self._busy_saved_states = {}
         self._reservation_check_job = None

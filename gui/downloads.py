@@ -121,6 +121,8 @@ class DownloadsMixin:
         self._unregister_active_download(key)
         if hasattr(self, 'files_tree'):
             self._refresh_files_list()
+        if had_data:
+            self._request_cm_chapters(output_path)
         if not had_data:
             detail = f"\n（{error}）" if error else ""
             message = (

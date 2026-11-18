@@ -1,10 +1,11 @@
-"""CMカット用フィンガープリント取得の定期実行と設定ダイアログ"""
+"""CMカット用フィンガープリント取得・CMチャプター付けの定期実行と設定ダイアログ"""
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import os
+from pathlib import Path
 
 from utils.app_logger import LOG_DIR
 
@@ -16,6 +17,8 @@ class CmFingerprintMixin:
     # 以降のチェック間隔（ミリ秒）
     CM_FP_STARTUP_DELAY_MS = 2 * 60 * 1000
     CM_FP_CHECK_INTERVAL_MS = 60 * 1000
+    # 放送から3日経った録音にCMチャプターを付け直すかを確かめる間隔
+    CM_CHAPTER_DUE_INTERVAL = timedelta(minutes=30)
 
     def _check_cm_fp_run_due(self):
         """CMフィンガープリントの自動取得（1日1回）を始める時刻かを定期的にチェックする
@@ -43,7 +46,38 @@ class CmFingerprintMixin:
                     logger.info("CMフィンガープリントの自動取得を開始しました")
         except Exception:
             logger.exception("CMフィンガープリントの自動取得チェックでエラーが発生しました")
+        try:
+            self._queue_due_cm_chapters()
+        except Exception:
+            logger.exception("CMチャプターの付け直しチェックでエラーが発生しました")
         self._cm_fp_check_job = self.root.after(self.CM_FP_CHECK_INTERVAL_MS, self._check_cm_fp_run_due)
+
+    def _queue_due_cm_chapters(self):
+        """放送から3日経った録音に、CMチャプターを付け直す（指紋取得の実行中は待つ）"""
+        now = datetime.now()
+        last = self._cm_chapter_due_checked
+        if last is not None and now - last < self.CM_CHAPTER_DUE_INTERVAL:
+            return
+        if not self.cm_chapterer.settings['cm_chapter_auto'] or self.cm_fp_collector.is_running():
+            return
+        self._cm_chapter_due_checked = now
+        for path in self.cm_chapterer.due_paths(now):
+            self.cm_chapterer.request(path, "放送から3日後の付け直し")
+
+    def _request_cm_chapters(self, output_path):
+        """録音・タイムフリー取得が終わったファイルに、CMチャプターを付ける（自動がオンのとき）"""
+        if not output_path or not self.cm_chapterer.settings['cm_chapter_auto']:
+            return
+        path = Path(output_path)
+        if path.suffix.lower() == ".m4a" and path.exists() and path.stat().st_size > 0:
+            self.cm_chapterer.request(path, "録音直後")
+
+    def _on_cm_chapters_finished(self, path, record):
+        """CMチャプターを付け終えたとき（メインスレッドから呼ばれる）"""
+        if record.get('result') == 'error':
+            logger.warning(f"CMチャプターを付けられませんでした: {path}（{record.get('error')}）")
+        if hasattr(self, 'files_tree'):
+            self._refresh_files_list()
 
     def _cm_fp_busy_reason(self):
         """CMフィンガープリント取得を止めるべきなら理由を返す（取得スレッドから呼ばれる）
@@ -130,8 +164,16 @@ class CmFingerprintMixin:
             variable=keep_audio_var
         ).pack(anchor=tk.W, pady=(8, 0))
 
+        chapter_auto_var = tk.BooleanVar(value=bool(self.cm_chapterer.settings['cm_chapter_auto']))
+        ttk.Checkbutton(
+            frame, text="録音にCMチャプターを自動で付ける（録音直後と、放送から3日後にもう一度）",
+            variable=chapter_auto_var
+        ).pack(anchor=tk.W, pady=(8, 0))
+
         status_var = tk.StringVar()
         ttk.Label(frame, textvariable=status_var, foreground="#3a6ea5").pack(anchor=tk.W, pady=(12, 0))
+        chapter_status_var = tk.StringVar()
+        ttk.Label(frame, textvariable=chapter_status_var, foreground="#3a6ea5").pack(anchor=tk.W)
 
         def refresh_status():
             if not dialog.winfo_exists():
@@ -141,6 +183,11 @@ class CmFingerprintMixin:
             if status['state'] != 'idle' and status['total']:
                 text += f"　{status['done']}/{status['total']}件完了"
             status_var.set(f"状態: {text}")
+            chapter = self.cm_chapterer.get_status()
+            chapter_text = chapter['message']
+            if chapter['queued'] > 1:
+                chapter_text += f"（ほか{chapter['queued'] - 1}件待ち）"
+            chapter_status_var.set(f"CMチャプター: {chapter_text}")
             run_button.config(state=tk.DISABLED if collector.is_running() else tk.NORMAL)
             stop_button.config(state=tk.NORMAL if collector.is_running() else tk.DISABLED)
             dialog.after(1000, refresh_status)
@@ -159,6 +206,7 @@ class CmFingerprintMixin:
                 'cm_fp_window_end': end,
                 'cm_fp_retention_days': int(retention_var.get()),
                 'cm_fp_keep_audio': keep_audio_var.get(),
+                'cm_chapter_auto': chapter_auto_var.get(),
             }
 
         def apply_values():
@@ -167,6 +215,7 @@ class CmFingerprintMixin:
                 return None
             self.manager.save_settings(values)
             collector.update_settings(values)
+            self.cm_chapterer.update_settings(values)
             if not values['cm_fp_enabled'] and collector.is_running():
                 collector.stop("自動取得をオフにしました")
             return values

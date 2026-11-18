@@ -15,6 +15,7 @@ Tkの実ウィンドウはテストごとに作り直すとTcl側の状態がま
 1つだけ生成して使い回す（各テストではその上にRecRAppを作り直し、
 ウィジェットだけ後始末する）。
 """
+import os
 import time
 import tkinter as tk
 from datetime import datetime, timedelta
@@ -878,6 +879,49 @@ def test_files_list_sorts_size_column_by_bytes(app, tmp_path):
 
     app._sort_treeview_column(tree, "size", True)
     assert [tree.set(item, "name") for item in tree.get_children("")] == ["b.mp3", "a.mp3", "c.mp3"]
+
+
+def _old_file(path, size=1024):
+    path.write_bytes(b"\0" * size)
+    os.utime(path, (time.time() - 3600, time.time() - 3600))
+    return path
+
+
+def test_cm_chapter_button_queues_selected_m4a_or_all(app, monkeypatch, tmp_path):
+    """選んだファイル（未選択なら全部）のうち、録音中でない m4a だけを順番待ちに入れる"""
+    app.manager.output_dir = tmp_path
+    a = _old_file(tmp_path / "a.m4a")
+    _old_file(tmp_path / "b.mp3")
+    c = _old_file(tmp_path / "c.m4a")
+    (tmp_path / "recording.m4a").write_bytes(b"\0" * 1024)  # 更新されたばかり＝録音中かもしれない
+    _old_file(tmp_path / ".a.cmtmp.m4a")  # 付けている途中の一時ファイルは一覧に出さない
+    app._refresh_files_list()
+    assert ".a.cmtmp.m4a" not in [app.files_tree.set(i, "name") for i in app.files_tree.get_children("")]
+    requested = []
+    monkeypatch.setattr(app.cm_chapterer, "request", lambda path, reason: requested.append((path, reason)))
+    monkeypatch.setattr(messagebox, "askyesno", lambda *a, **k: True)
+
+    app._add_cm_chapters_to_files()
+    assert sorted(p.name for p, _ in requested) == ["a.m4a", "c.m4a"]
+
+    requested.clear()
+    item = next(i for i, p in app._files_row_map.items() if p == c)
+    app.files_tree.selection_set(item)
+    app._add_cm_chapters_to_files()
+    assert requested == [(c, "手動")]
+    assert a.exists()
+
+
+def test_cm_chapters_are_requested_after_recording_when_enabled(app, monkeypatch, tmp_path):
+    requested = []
+    monkeypatch.setattr(app.cm_chapterer, "request", lambda path, reason: requested.append(path.name))
+    path = tmp_path / "rec.m4a"
+    path.write_bytes(b"\0" * 10)
+    app._on_manual_recording_complete("TBSラジオ", True, str(path), None)
+    assert requested == ["rec.m4a"]
+    app.cm_chapterer.update_settings({'cm_chapter_auto': False})
+    app._on_manual_recording_complete("TBSラジオ", True, str(path), None)
+    assert requested == ["rec.m4a"]
 
 
 # --- 取り逃した予約の自動取得 ---------------------------------------------
