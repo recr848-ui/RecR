@@ -594,6 +594,8 @@ class CmChapterer:
         record = {'last_run': now.isoformat(timespec="seconds"), 'reason': reason}
         if not path.exists():
             record.update(result='skipped', detail="ファイルがありません")
+            # 無いファイルの記録は残さない（キーにするパスが存在しないため）。ログだけ出す
+            self.log.info(f"CMチャプター: 対象外 {name}（ファイルがありません。移動・名前の変更・削除された可能性）")
             return record
 
         station = station_from_tags(path)
