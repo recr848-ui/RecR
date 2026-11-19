@@ -88,6 +88,10 @@ FETCH_PARALLEL_SPLITS = 8
 # 長さ（5秒）ちょうどにすると、境目が少しずれたときに1つ取りこぼすため、重なる側に寄せる
 # （重なって載った取得済みのセグメントは捨てる）
 RESUME_OFFSET_SECONDS = 1
+# タイムフリーの1セグメントの長さ（秒）と、セグメントの開始時刻が早めに付いている分の許容
+# （録音で中断したとき、区間の最後のセグメントまで取れているかの判定に使う）
+SEGMENT_SECONDS = 5
+END_SLACK_SECONDS = 1
 # 解析待ちにできるチャンク数（1件あたり約22MB。これを超えると取得側が待つ）
 ANALYSIS_QUEUE_SIZE = 2
 # 番組表で放送休止を表す番組名（「放送休止」「放送休止中」「休止中(PART1)」
@@ -850,6 +854,16 @@ class FingerprintCollector:
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             log.exception(f"取得エラー: {label}")
+
+        if abort.get('result') == 'paused' and not error:
+            # 最後のセグメントまで取れていて、続きが無いことを確かめている最中に止めた区間は
+            # 取り終えたものとする。全区間がそうなら中断せずにこのまま完了にする
+            for r in partial:
+                if (not r['done'] and r['last_dt'] is not None and not r.get('unknown_dt')
+                        and r['last_dt'] + timedelta(seconds=SEGMENT_SECONDS + END_SLACK_SECONDS) >= r['end']):
+                    r['done'] = True
+            if all(r['done'] for r in partial):
+                abort = {}
 
         segments = [seg for r in partial for seg in r['segments']]
         wall = time.monotonic() - wall_start

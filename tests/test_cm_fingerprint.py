@@ -265,6 +265,23 @@ def test_fetch_chunk_aborts_when_recording_starts(tmp_path):
     assert not collector.fp_path("TBS", chunk['bday'], chunk['hour']).exists()
 
 
+def test_fetch_chunk_completes_when_recording_starts_after_last_segment(tmp_path):
+    """最後のセグメントまで取り終えた後に録音が始まったら、中断せずにそのまま完了にする
+    （続きが無いことを確かめている最中の中断で、録音が終わるまで待たされないように）"""
+    busy = {'calls': 0}
+
+    def busy_reason():
+        busy['calls'] += 1
+        return "オンタイム録音中（TBS）" if busy['calls'] >= 12 else None
+
+    # エンコーダーの余りで13件目（チャンクの外）ができるため、チャンク内の12件にする
+    collector, manager = _collector(tmp_path, _aac_segments(60)[:12], busy=busy_reason)
+    job = collector._download_chunk(_chunk(60), cmfp.threading.Event())
+    assert busy['calls'] == 12
+    assert job['result'] == 'done'
+    assert job['segments'] == manager.segments
+
+
 def test_chunk_is_retried_after_recording_ends(tmp_path, monkeypatch):
     monkeypatch.setattr(cmfp, "PAUSE_POLL_SECONDS", 0.01)
     state = {'calls': 0}

@@ -397,6 +397,10 @@ class StreamMixin:
     # 新規セグメントの枯渇を「番組の終わりに達した」とみなす。これより手前で
     # 起きた場合は途中で切れたものとして扱う
     TIMEFREE_END_TOLERANCE_SECONDS = 15
+    # セグメントの開始時刻は数ミリ秒早いことがある（例: 21:59:54.996）。その分は最後の
+    # セグメントの判定で許す（許さないと to_dt にわずかに届かず、続きが無いことを確かめる
+    # 約25秒の待ちに落ちる）
+    TIMEFREE_LAST_SEGMENT_SLACK_SECONDS = 1
 
     def _iter_timefree_segments(self, playlist_url, headers, stop_event, to_dt, on_progress=None,
                                 renew_playlist_url=None, log=None, with_times=False):
@@ -558,7 +562,8 @@ class StreamMixin:
                         # セグメント側（下記）で先に終端を検知する
                         reached_end = True
                         break
-                    if seg_dt + timedelta(seconds=target_duration) >= to_dt:
+                    if seg_dt + timedelta(
+                            seconds=target_duration + self.TIMEFREE_LAST_SEGMENT_SLACK_SECONDS) >= to_dt:
                         # このセグメントの再生範囲が to_dt に達する＝実質最後のセグメント。
                         # 取得してから終了する
                         is_last_segment = True

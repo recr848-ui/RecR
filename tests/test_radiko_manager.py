@@ -758,8 +758,9 @@ def test_iter_timefree_segments_treats_404_near_the_end_as_complete(manager, mon
     assert segments == [b"193000", b"193005", b"193010", b"193015"]
 
 
-def _install_stalling_timefree_server(monkeypatch, segment_count):
-    """medialistが毎回同じ segment_count 件（5秒刻み）だけを返し、それ以上進まない配信"""
+def _install_stalling_timefree_server(monkeypatch, segment_count, offset=timedelta(0)):
+    """medialistが毎回同じ segment_count 件（5秒刻み）だけを返し、それ以上進まない配信。
+    offset を渡すと、各セグメントの開始時刻をその分ずらす"""
 
     def fake_get(url, headers=None, timeout=None):
         if "/playlist" in url:
@@ -767,7 +768,7 @@ def _install_stalling_timefree_server(monkeypatch, segment_count):
         if "/medialist" in url:
             lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:5", "#EXT-X-MEDIA-SEQUENCE:0"]
             for i in range(segment_count):
-                seg_dt = _TF_BASE + timedelta(seconds=5 * i)
+                seg_dt = _TF_BASE + timedelta(seconds=5 * i) + offset
                 lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{seg_dt.isoformat()}+09:00")
                 lines.append(f"http://x/seg/{seg_dt:%H%M%S}")
             return _FakeResponse(text="\n".join(lines) + "\n")
@@ -778,6 +779,21 @@ def _install_stalling_timefree_server(monkeypatch, segment_count):
 
     monkeypatch.setattr(requests, "Session", FakeSession)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+
+def test_iter_timefree_segments_ends_without_stall_when_times_are_slightly_early(manager, monkeypatch, caplog):
+    """セグメントの開始時刻が数ミリ秒早くても、最後のセグメントを取った時点で終わる
+    （続きが無いことを確かめる約25秒の待ちに落ちない）"""
+    import logging
+
+    _install_stalling_timefree_server(monkeypatch, segment_count=6, offset=timedelta(milliseconds=-4))
+    with caplog.at_level(logging.INFO, logger="utils.radiko_manager"):
+        segments = list(manager._iter_timefree_segments(
+            _tf_playlist_url(_TF_BASE), {}, _InstantEvent(), _TF_BASE + timedelta(seconds=30),
+        ))
+
+    assert len(segments) == 6
+    assert not any("区間の終わりまで取得しました" in r.getMessage() for r in caplog.records)
 
 
 def test_iter_timefree_segments_stall_at_the_end_is_logged_as_info(manager, monkeypatch, caplog):
